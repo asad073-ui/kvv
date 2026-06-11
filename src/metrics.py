@@ -54,6 +54,9 @@ def batch_em(predictions: List[str], ground_truths: List[str]) -> float:
 def token_f1(prediction: str, ground_truth: str) -> float:
     pred_tokens  = _normalize(prediction).split()
     gold_tokens  = _normalize(ground_truth).split()
+    # FIX-F1DIV: guard against empty token lists after normalisation
+    if not pred_tokens or not gold_tokens:
+        return 0.0
     common       = Counter(pred_tokens) & Counter(gold_tokens)
     num_same     = sum(common.values())
     if num_same == 0:

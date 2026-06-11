@@ -38,6 +38,18 @@ FIX LOG
   FIX-8         _load_from_hf uses while loop for nested list unwrapping.
   FIX-DEEPCOPY  prefix_kvcache deep-copied per query to prevent mutation.
   FIX-ERRLOG    log.error with exc_info=True for full tracebacks.
+
+  FIX-EXTRACT   _extract_short_answer rewritten: removed greedy " is "/" was " markers
+                that matched mid-sentence and produced wrong spans → EM≈0 on all conds.
+  FIX-SAFECACHE _safe_from_legacy_cache: auto-detect format with fallback if
+                from_legacy_cache produces an empty DynamicCache.
+  FIX-F1DIV     Guard against ZeroDivisionError when prediction normalises to empty.
+  FIX-HHEM-IDX  HHEM/NLI record lookup uses index slicing instead of O(n²) filter.
+  FIX-TLOAD     torch.load uses weights_only=False for dicts with mixed Python types.
+  FIX-NORMDUP   Removed duplicate _normalize_answer; uses _normalize from metrics.py.
+  FIX-GUARD     generate_with_cache: if stacked cache is empty (cached_len==0), fall
+                back to C0-style full-prompt generation instead of silently generating
+                a context-free answer that inflates C1/C2/C3 scores.
 """
 
 import os
@@ -68,6 +80,7 @@ from metrics import (
     batch_em, batch_f1,
     HHEMScorer, DeBERTaNLIScorer,
     hallucination_rate, mean_entailment,
+    _normalize as _normalize_answer,
 )
 
 from llama_index.core import Settings, load_index_from_storage, StorageContext, QueryBundle
@@ -216,6 +229,37 @@ def _set_seen_tokens(cache: DynamicCache) -> DynamicCache:
     return cache
 
 
+def _safe_from_legacy_cache(per_layer_pairs):
+    """
+    FIX-SAFECACHE: Build a DynamicCache from per-layer (k,v) pairs.
+
+    Tries the expected format first (based on transformers version).
+    If from_legacy_cache produces an empty DynamicCache despite non-empty input,
+    falls back to the other format.  This guards against version-detection
+    errors and future transformers releases.
+    """
+    if not per_layer_pairs:
+        log.warning("_safe_from_legacy_cache called with empty per_layer_pairs")
+        return _set_seen_tokens(DynamicCache())
+
+    use_new = _legacy_fmt_is_new()
+    fmt = _to_new_legacy_format(per_layer_pairs) if use_new else tuple(per_layer_pairs)
+    cache = DynamicCache.from_legacy_cache(fmt)
+
+    # Verify it actually populated — if not, try the other format
+    if hasattr(cache, "key_cache") and len(cache.key_cache) == 0:
+        log.warning(
+            "from_legacy_cache produced empty cache with %s format; "
+            "trying %s format as fallback.",
+            "new" if use_new else "old",
+            "old" if use_new else "new",
+        )
+        fmt = tuple(per_layer_pairs) if use_new else _to_new_legacy_format(per_layer_pairs)
+        cache = DynamicCache.from_legacy_cache(fmt)
+
+    return _set_seen_tokens(cache)
+
+
 def legacy_to_dynamic(legacy, from_dynamic_cache: bool = False) -> DynamicCache:
     """
     Convert a legacy cache (disk or live DynamicCache) to a DynamicCache.
@@ -223,12 +267,10 @@ def legacy_to_dynamic(legacy, from_dynamic_cache: bool = False) -> DynamicCache:
     FIX-ROOT + FIX-2LAYER + FIX-VERCHECK: normalise to per-layer pairs first,
     then build the format that the installed transformers version expects.
     FIX-SEEN: patch _seen_tokens immediately after construction.
+    FIX-SAFECACHE: auto-detect format with fallback.
     """
     per_layer = _normalise_legacy(legacy, from_dynamic_cache=from_dynamic_cache)
-    # Pass the correct format based on installed transformers version.
-    fmt = _to_new_legacy_format(per_layer) if _legacy_fmt_is_new() else tuple(per_layer)
-    cache = DynamicCache.from_legacy_cache(fmt)
-    return _set_seen_tokens(cache)
+    return _safe_from_legacy_cache(per_layer)
 
 
 def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCache:
@@ -247,6 +289,15 @@ def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCa
             legacy_list.append(_normalise_legacy(c, from_dynamic_cache=False))
 
     num_layers = len(legacy_list[0])
+    if num_layers == 0:
+        log.error(
+            "stack_past_key_values: num_layers=0 — all caches are empty. "
+            "This usually means from_legacy_cache received the wrong format. "
+            "legacy_list sizes: %s",
+            [len(c) for c in legacy_list],
+        )
+        return _set_seen_tokens(DynamicCache())
+
     stacked_pairs = [
         (
             torch.cat([c[layer][0] for c in legacy_list], dim=2),
@@ -254,9 +305,7 @@ def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCa
         )
         for layer in range(num_layers)
     ]
-    fmt = _to_new_legacy_format(stacked_pairs) if _legacy_fmt_is_new() else tuple(stacked_pairs)
-    cache = DynamicCache.from_legacy_cache(fmt)
-    return _set_seen_tokens(cache)
+    return _safe_from_legacy_cache(stacked_pairs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -272,51 +321,66 @@ def trim_context_for_hhem(context: str, max_tokens: int = 512) -> str:
 # Accuracy helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _normalize_answer(text: str) -> str:
-    """Lower-case, strip punctuation and articles, collapse whitespace."""
-    text = text.lower()
-    text = text.translate(str.maketrans("", "", "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"))
-    text = re.sub(r"\b(a|an|the)\b", " ", text)
-    return " ".join(text.split())
+# FIX-NORMDUP: _normalize_answer is now imported from metrics.py as
+# _normalize_answer (aliased from _normalize) to avoid duplicate
+# implementations that could silently diverge.
 
 
 def _extract_short_answer(text: str) -> str:
     """
-    FIX-EM / Change 2: Pull a short answer span from a free-form generation.
+    FIX-EXTRACT: Pull a short answer span from a free-form generation.
 
     The model outputs multi-sentence explanations; EM against a gold span like
-    "Paris" will always be 0 on raw text. This heuristic extracts the likely
+    "Paris" will always be 0 on raw text.  This heuristic extracts the likely
     answer span so EM is meaningful.
 
-    Used ONLY for EM computation. F1, HHEM, and NLI intentionally keep raw preds
-    because they reward partial matches / faithfulness of the full response.
+    Used ONLY for EM computation.  F1, HHEM, and NLI intentionally keep raw
+    preds because they reward partial matches / faithfulness of the full response.
 
-    Strategy:
-      1. Look for explicit answer markers ("answer is", "is", "was", etc.)
-         and take the first short span after the marker.
-      2. If no marker found, return the first sentence (up to first '.').
+    Strategy (multi-tier, from most to least specific):
+      1. Explicit answer markers: "the answer is", "answer is", "answer:"
+         — high confidence, take the span after the marker.
+      2. First sentence: most QA models front-load the answer.
+      3. First N words: last resort for single-phrase outputs.
+
+    REMOVED: greedy markers " is ", " was ", " are ", " were " which matched
+    mid-sentence and produced wrong spans (Bug 4 — primary cause of EM ≈ 0).
     """
     text = text.strip()
-    # Common answer-introducing phrases, ordered by specificity.
-    markers = [
+    if not text:
+        return ""
+
+    lower = text.lower()
+
+    # ── Tier 1: explicit answer-introducing phrases (high confidence) ──
+    explicit_markers = [
+        "the answer is ",
         "answer is ",
         "answer: ",
-        " is ",
-        " was ",
-        " are ",
-        " were ",
+        "the answer to the question is ",
+        "the answer to this question is ",
     ]
-    for marker in markers:
-        idx = text.lower().find(marker)
+    for marker in explicit_markers:
+        idx = lower.find(marker)
         if idx != -1:
             span = text[idx + len(marker):]
-            # Trim at first sentence boundary or comma.
-            span = span.split(".")[0].split(",")[0].strip()
-            # Only trust short spans — long ones are likely still a sentence.
-            if 1 <= len(span.split()) <= 10:
+            # Trim at first sentence boundary, comma, or semicolon.
+            for sep in ('.', ',', ';', '\n'):
+                span = span.split(sep)[0]
+            span = span.strip().rstrip('.')
+            if 1 <= len(span.split()) <= 12:
                 return span
-    # Fallback: first sentence.
-    return text.split(".")[0].strip()
+
+    # ── Tier 2: first sentence (most QA models front-load the answer) ──
+    # Split on period followed by space (avoids splitting on "U.S." etc.)
+    sentences = re.split(r'(?<=\w)\.\s', text, maxsplit=1)
+    first_sent = sentences[0].strip().rstrip('.')
+    if 1 <= len(first_sent.split()) <= 15:
+        return first_sent
+
+    # ── Tier 3: first N words (last resort for very long first sentences) ──
+    words = text.split()
+    return " ".join(words[:10]).rstrip(".,;:!?")
 
 
 def batch_contain_em(predictions: List[str], ground_truths: List[str]) -> float:
@@ -359,6 +423,30 @@ def generate_with_cache(
             suffix         = build_query_suffix(query)
             new_input_ids  = tokenizer.encode(suffix, return_tensors="pt").to(device)
             cached_len     = _get_cache_seq_len(past_kvcache)
+
+            # FIX-GUARD: if the stacked cache is empty (both format attempts failed
+            # in _safe_from_legacy_cache), do NOT run generate() with a broken empty
+            # cache — that produces a silently wrong context-free answer that would
+            # artificially inflate C1/C2/C3 scores. Fall back to C0-style generation.
+            if cached_len == 0:
+                log.error(
+                    "generate_with_cache: stacked cache is empty (cached_len=0). "
+                    "Both DynamicCache format attempts failed. "
+                    "Falling back to C0-style full-prompt generation."
+                )
+                prompt    = build_full_prompt(chunks, query)
+                input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+                outputs   = model.generate(
+                    input_ids,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    pad_token_id=tokenizer.eos_token_id,
+                    do_sample=False,
+                    temperature=1.0,
+                    eos_token_id=EOS_TOKEN_IDS,
+                )
+                new_tokens = outputs[0][input_ids.shape[1]:]
+                return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
             attention_mask = torch.ones(
                 1, cached_len + new_input_ids.shape[1],
                 device=device, dtype=torch.long,
@@ -440,7 +528,12 @@ def run_query(
             node       = nws.node
             cache_key  = f"kvcache_{precision}"
             fpath      = node.metadata[cache_key]
-            compressed = torch.load(fpath, weights_only=True)
+            # FIX-TLOAD: compressed caches are dicts with mixed Python types
+            # (str, list, bool) that weights_only=True rejects on PyTorch 2.6+.
+            try:
+                compressed = torch.load(fpath, weights_only=True)
+            except Exception:
+                compressed = torch.load(fpath, weights_only=False)
             legacy     = decompress_kvcache(compressed, precision)
             # Disk-loaded → from_dynamic_cache=False (always old per-layer format)
             kvcache_list.append(legacy_to_dynamic(legacy, from_dynamic_cache=False))
@@ -634,6 +727,7 @@ def main():
                 log.info(f"  Condition={condition}  K={k}")
                 preds, refs, contexts = [], [], []
                 ttft_list, kv_size_list = [], []
+                record_start_idx = len(all_records)  # FIX-HHEM-IDX
 
                 for ex in tqdm(examples, desc=f"{ds_name} K={k} {condition}"):
                     query  = ex["query"]
@@ -669,12 +763,21 @@ def main():
                             exc_info=True,
                         )
 
-                # FIX-EM (Change 2): EM uses extracted short answer spans.
+                # FIX-EM / FIX-EXTRACT: EM uses extracted short answer spans.
                 # F1 keeps raw preds intentionally.
                 em_preds   = [_extract_short_answer(p) for p in preds]
                 f1_score   = batch_f1(preds, refs)          # raw
                 em_score   = batch_em(em_preds, refs)       # extracted
-                contain_em = batch_contain_em(preds, refs)  # FIX-5, raw
+                contain_em = batch_contain_em(preds, refs)  # FIX-5, raw (gold ⊆ pred)
+
+                # Debug: log first few extraction examples so users can verify
+                if preds and log.isEnabledFor(logging.DEBUG):
+                    for i in range(min(3, len(preds))):
+                        log.debug(
+                            "  [%d] raw=%r  extracted=%r  gold=%r  em=%d",
+                            i, preds[i][:80], em_preds[i], refs[i],
+                            1 if _normalize_answer(em_preds[i]) == _normalize_answer(refs[i]) else 0,
+                        )
 
                 # FIX-NAN: guard against empty preds
                 avg_ttft = (sum(ttft_list) / len(ttft_list)) if ttft_list else float("nan")
@@ -692,10 +795,8 @@ def main():
                     hall_rate     = hallucination_rate(faith_scores)
                     n_total       = len(faith_scores)
                     n_hall        = sum(1 for s in faith_scores if s < HHEM_THRESHOLD)
-                    matching = [
-                        r for r in all_records
-                        if r["dataset"] == ds_name and r["k"] == k and r["condition"] == condition
-                    ]
+                    # FIX-HHEM-IDX: direct slice instead of O(n²) filter scan
+                    matching = all_records[record_start_idx:]
                     for rec, fs in zip(matching, faith_scores):
                         rec["hhem_faithfulness"] = fs
                         rec["hhem_hallucinated"] = fs < HHEM_THRESHOLD
@@ -704,10 +805,8 @@ def main():
                     nli_contexts = [trim_context_for_hhem(c, max_tokens=512) for c in contexts]
                     nli_scores = nli_scorer.batch_score(nli_contexts, preds)  # FIX-6
                     ent_score  = mean_entailment(nli_scores)
-                    matching = [
-                        r for r in all_records
-                        if r["dataset"] == ds_name and r["k"] == k and r["condition"] == condition
-                    ]
+                    # FIX-HHEM-IDX: direct slice instead of O(n²) filter scan
+                    matching = all_records[record_start_idx:]
                     for rec, ns in zip(matching, nli_scores):
                         rec["nli_entailment"]    = ns[0]
                         rec["nli_neutral"]       = ns[1]
