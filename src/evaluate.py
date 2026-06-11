@@ -29,6 +29,10 @@ FIX LOG
   FIX-CSV       DictWriter quoting=QUOTE_ALL prevents pandas ParserError.
   FIX-NAN       avg_ttft NaN guard prevents tabulate crash on empty preds.
   FIX-1         torch_dtype= (not dtype=) in from_pretrained.
+                BUG: from_pretrained(..., dtype=torch.bfloat16) silently ignores
+                the unknown kwarg and loads the model in float32, wasting 2× GPU
+                memory and causing dtype mismatches with bfloat16 KV caches.
+                FIX: must use torch_dtype=torch.bfloat16 — the correct parameter name.
   FIX-2         context joined with "\\n\\n".
   FIX-3         trim_context_for_hhem uses full joined context up to 512 tokens.
   FIX-4         F1 computed on raw preds; EM on extracted short answer.
@@ -52,6 +56,7 @@ FIX LOG
                 a context-free answer that inflates C1/C2/C3 scores.
 """
 
+
 import os
 import sys
 import json
@@ -65,13 +70,16 @@ import re
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
+
 import torch
 from tqdm import tqdm
 from tabulate import tabulate
 
+
 # Change 3: import top-level transformers for version check
 import transformers
 from transformers import AutoTokenizer, DynamicCache
+
 
 sys.path.insert(0, os.path.dirname(__file__))
 from qwen2 import Qwen2ModifiedForCausalLM
@@ -83,17 +91,21 @@ from metrics import (
     _normalize as _normalize_answer,
 )
 
+
 from llama_index.core import Settings, load_index_from_storage, StorageContext, QueryBundle
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Prompt construction
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 SYSTEM_PROMPT = (
     "<|im_start|>system\n"
@@ -105,20 +117,25 @@ SYSTEM_PROMPT = (
     "information in documents.'.<|im_end|><|im_start|>user\nDocs:"
 )
 
+
 QUERY_SUFFIX_TEMPLATE = "\n\nQuestion: {query}<|im_end|><|im_start|>assistant\n"
+
 
 
 def build_full_prompt(chunks: List[str], query: str) -> str:
     return SYSTEM_PROMPT + "".join(chunks) + QUERY_SUFFIX_TEMPLATE.format(query=query)
 
 
+
 def build_query_suffix(query: str) -> str:
     return QUERY_SUFFIX_TEMPLATE.format(query=query)
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # KV cache stitching  (FIX-ROOT + FIX-SEEN + FIX-2LAYER + FIX-VERCHECK)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _normalise_legacy(legacy_cache):
     """
@@ -148,6 +165,7 @@ def _normalise_legacy(legacy_cache):
     return list(legacy_cache)
 
 
+
 def _build_dynamic_cache(per_layer_pairs) -> DynamicCache:
     """
     Build a DynamicCache by directly populating key_cache/value_cache lists.
@@ -169,6 +187,7 @@ def _build_dynamic_cache(per_layer_pairs) -> DynamicCache:
     return cache
 
 
+
 def legacy_to_dynamic(legacy) -> DynamicCache:
     """
     Convert a disk-loaded legacy cache to a DynamicCache.
@@ -178,6 +197,7 @@ def legacy_to_dynamic(legacy) -> DynamicCache:
     """
     per_layer = _normalise_legacy(legacy)
     return _build_dynamic_cache(per_layer)
+
 
 
 def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCache:
@@ -211,22 +231,27 @@ def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCa
     return _build_dynamic_cache(stacked_pairs)
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Context helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def trim_context_for_hhem(context: str, max_tokens: int = 512) -> str:
     """Truncate context to fit inside the scorer's token window. (FIX-3)"""
     return context[: max_tokens * 4]
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Accuracy helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 # FIX-NORMDUP: _normalize_answer is now imported from metrics.py as
 # _normalize_answer (aliased from _normalize) to avoid duplicate
 # implementations that could silently diverge.
+
 
 
 def _extract_short_answer(text: str) -> str:
@@ -286,6 +311,7 @@ def _extract_short_answer(text: str) -> str:
     return " ".join(words[:10]).rstrip(".,;:!?")
 
 
+
 def batch_contain_em(predictions: List[str], ground_truths: List[str]) -> float:
     """
     FIX-5: Contain-EM — fraction where normalised gold is a substring of
@@ -299,12 +325,15 @@ def batch_contain_em(predictions: List[str], ground_truths: List[str]) -> float:
     ) / len(predictions)
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Generation
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 EOS_TOKEN_IDS  = [151645, 151643]
 MAX_NEW_TOKENS = 64
+
 
 
 def _get_cache_seq_len(cache: DynamicCache) -> int:
@@ -312,6 +341,7 @@ def _get_cache_seq_len(cache: DynamicCache) -> int:
     if hasattr(cache, "key_cache") and len(cache.key_cache) > 0:
         return cache.key_cache[0].shape[2]
     return cache.get_seq_length()
+
 
 
 def generate_with_cache(
@@ -381,9 +411,11 @@ def generate_with_cache(
             return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-query inference for each condition
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 PRECISION_MAP = {"C0": None, "C1": "fp16", "C2": "int8", "C3": "int4"}
 CONDITION_LABELS = {
@@ -392,6 +424,7 @@ CONDITION_LABELS = {
     "C2": "INT8 TurboRAG",
     "C3": "INT4 TurboRAG",
 }
+
 
 
 def run_query(
@@ -467,9 +500,12 @@ def run_query(
         "ttft_seconds":  ttft,
         "kv_size_bytes": kv_size_bytes,
     }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset loaders
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _load_from_hf(
     hf_name, hf_config, hf_split, num_examples,
@@ -506,6 +542,7 @@ def _load_from_hf(
     return examples
 
 
+
 def _load_from_jsonl(query_file: str, num_examples: int) -> List[Dict]:
     examples = []
     with open(query_file) as f:
@@ -521,6 +558,7 @@ def _load_from_jsonl(query_file: str, num_examples: int) -> List[Dict]:
     return examples
 
 
+
 def load_dataset_examples(
     dataset_name, query_file, num_examples,
     hf_name=None, hf_config=None, hf_split="validation",
@@ -534,9 +572,11 @@ def load_dataset_examples(
     raise ValueError(f"Dataset '{dataset_name}': provide either --hf_names or --query_files")
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main evaluation loop
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def main():
     parser = argparse.ArgumentParser(description="TurboRAG KV-cache quantization evaluation")
@@ -593,10 +633,29 @@ def main():
 
     attn_impl = "flash_attention_2" if args.use_flash_attn else "eager"
     log.info(f"Loading model: {args.model_name} (attn={attn_impl})")
+
+    # ─── FIX-1 ──────────────────────────────────────────────────────────────
+    # WRONG (the original bug):
+    #   model = Qwen2ModifiedForCausalLM.from_pretrained(
+    #       args.model_name,
+    #       attn_implementation=attn_impl,
+    #       dtype=torch.bfloat16,        # ← WRONG: silently ignored by HF
+    #   ).to(device)
+    #
+    # `dtype=` is NOT a recognised kwarg for from_pretrained.  HuggingFace
+    # absorbs unknown kwargs via **kwargs in some versions and silently ignores
+    # them, loading the model in the default float32.  This causes:
+    #   1. 2× GPU memory consumption (float32 vs bfloat16)
+    #   2. dtype mismatch → RuntimeError when bfloat16 KV tensors from disk
+    #      are concatenated with float32 prefix cache tensors in
+    #      stack_past_key_values → torch.cat raises dtype conflict.
+    #
+    # FIX: use torch_dtype= — the documented, correct parameter name.
+    # ────────────────────────────────────────────────────────────────────────
     model = Qwen2ModifiedForCausalLM.from_pretrained(
         args.model_name,
         attn_implementation=attn_impl,
-        torch_dtype=torch.bfloat16,   # FIX-1
+        torch_dtype=torch.bfloat16,   # FIX-1: torch_dtype=, NOT dtype=
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
@@ -791,6 +850,7 @@ def main():
         for r in summary_rows
     ]
     print("\n" + tabulate(table, headers=headers, tablefmt="grid"))
+
 
 
 if __name__ == "__main__":
