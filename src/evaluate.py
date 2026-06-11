@@ -112,10 +112,39 @@ def build_query_suffix(query: str) -> str:
 # KV cache stitching
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _normalise_legacy(legacy_cache):
+    """
+    Normalise DynamicCache.to_legacy_cache() output to per-layer (k, v) pairs.
+
+    transformers < 4.45  → ((k0,v0), (k1,v1), ..., (k23,v23))  len=24
+    transformers >= 4.45 → ((k0,k1,...,k23), (v0,v1,...,v23))   len=2
+
+    Both forms are normalised to: [(k0,v0), (k1,v1), ..., (k23,v23)]
+    """
+    if (
+        len(legacy_cache) == 2
+        and not isinstance(legacy_cache[0], torch.Tensor)
+        and hasattr(legacy_cache[0], "__len__")
+    ):
+        # New format: first element is a sequence of key tensors (not a single tensor)
+        all_keys, all_values = legacy_cache
+        return list(zip(all_keys, all_values))
+    # Old format: already a sequence of (key, value) per-layer tuples
+    return legacy_cache
+
+
 def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCache:
-    """Concatenate a list of DynamicCache objects along the sequence dimension."""
+    """
+    Concatenate a list of DynamicCache objects along the sequence dimension.
+
+    FIX: normalise to_legacy_cache() output before indexing so that both
+    transformers < 4.45 (per-layer pairs) and >= 4.45 (2-element tuple of
+    all-keys / all-values) are handled correctly.
+    """
     legacy_list = [
-        c.to_legacy_cache() if hasattr(c, "to_legacy_cache") else c
+        _normalise_legacy(
+            c.to_legacy_cache() if hasattr(c, "to_legacy_cache") else c
+        )
         for c in past_key_values_list
     ]
     num_layers = len(legacy_list[0])
