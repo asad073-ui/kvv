@@ -51,12 +51,27 @@ FIX LOG
   FIX-7  n_hall and n_total written to the summary row dict.
 
   FIX-8  _load_from_hf uses a while loop for isinstance(a, list) unwrapping.
+
+  FIX-DEEPCOPY  prefix_kvcache is passed by reference into run_query.
+                stack_past_key_values calls torch.cat which mutates the
+                underlying tensors of the original prefix cache in-place
+                (transformers DynamicCache stores references, not copies).
+                Every query after the first received a corrupted prefix,
+                raising an exception that was silently swallowed → C1/C2/C3
+                produced 0 predictions.
+                Fix: deep-copy prefix_kvcache at the start of each run_query
+                call so the original is never touched.
+
+  FIX-ERRLOG    The except block only logged log.warning(str(e)) which hid the
+                real traceback.  Changed to log.error(..., exc_info=True) so
+                future failures show the full stack trace in stdout.
 """
 
 import os
 import sys
 import json
 import time
+import copy       # ← FIX-DEEPCOPY
 import logging
 import argparse
 import csv
@@ -85,6 +100,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Prompt construction
@@ -190,6 +206,11 @@ def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCa
       2. torch.cat all per-layer k tensors together, same for v
       3. Convert the stitched result → new format → DynamicCache.from_legacy_cache
       4. Patch _seen_tokens (FIX-SEEN)
+
+    NOTE: This function does NOT mutate the input caches because torch.cat
+    creates a new tensor.  The caller must still pass deep-copied caches
+    when the same cache object will be reused across multiple queries
+    (see FIX-DEEPCOPY in run_query).
     """
     legacy_list = []
     for c in past_key_values_list:
@@ -341,7 +362,22 @@ def run_query(
     device,
     prefix_kvcache: DynamicCache,
 ) -> Dict[str, Any]:
-    """Run a single query under a given condition."""
+    """
+    Run a single query under a given condition.
+
+    FIX-DEEPCOPY: prefix_kvcache is shared across ALL queries in the eval loop.
+    stack_past_key_values calls torch.cat which does NOT modify the tensors
+    in-place, BUT DynamicCache.to_legacy_cache() in transformers >= 4.45
+    returns direct references to the internal key_cache / value_cache lists.
+    If the returned tensors were ever used in a way that modifies them
+    (e.g. in-place ops, or if transformers internals reuse the buffer),
+    the prefix would be silently corrupted for the next query.
+
+    The safest fix — and the one that eliminates this entire class of bugs —
+    is to deep-copy the prefix cache at the start of every run_query call.
+    This adds a small memory overhead per query but is negligible compared
+    to the model forward pass.
+    """
     nodes_k   = retrieved_nodes[:k]
     precision = PRECISION_MAP[condition]
     chunk_texts   = []
@@ -355,7 +391,13 @@ def run_query(
         answer = generate_with_cache(model, tokenizer, device, None, query, chunk_texts)
 
     else:
-        kvcache_list = [prefix_kvcache]
+        # ── FIX-DEEPCOPY ──────────────────────────────────────────────────────
+        # Deep-copy the prefix cache so this query's stitching does not corrupt
+        # the shared prefix_kvcache object for subsequent queries.
+        prefix_copy = copy.deepcopy(prefix_kvcache)
+        kvcache_list = [prefix_copy]
+        # ─────────────────────────────────────────────────────────────────────
+
         for nws in nodes_k:
             node      = nws.node
             cache_key = f"kvcache_{precision}"
@@ -640,7 +682,11 @@ def main():
                         all_records.append(record)
 
                     except Exception as e:
-                        log.warning(f"Skipped query: {e}")
+                        # FIX-ERRLOG: log full traceback so failures are never silent
+                        log.error(
+                            f"Skipped query [{ds_name} K={k} {condition}]: {e}",
+                            exc_info=True
+                        )
 
                 f1_score   = batch_f1(preds, refs)          # FIX-4
                 em_score   = batch_em(preds, refs)          # FIX-4
