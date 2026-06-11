@@ -145,8 +145,8 @@ def main():
                 row_f1   = safe_float(row["F1"])
                 row_hall = safe_float(row["hallucination_rate"])
                 f1_drop   = relative_drop(base_f1,   row_f1)
-                hall_drop = relative_drop(1 - base_hall, 1 - row_hall)  # faithfulness drop
-                asymmetric = hall_drop > f1_drop
+                faith_drop = relative_drop(1 - base_hall, 1 - row_hall)  # faithfulness drop
+                asymmetric = faith_drop > f1_drop
                 h1_rows.append({
                     "dataset":          ds,
                     "k":                k,
@@ -156,22 +156,25 @@ def main():
                     "cond_f1":          round(row_f1, 4),
                     "cond_hall":        round(row_hall, 4),
                     "f1_drop_pct":      round(f1_drop, 2),
-                    "hall_drop_pct":    round(hall_drop, 2),
+                    "faith_drop_pct":   round(faith_drop, 2),
                     "h1_supported":     asymmetric,
                 })
                 report_lines.append(
                     f"  {ds:12s} K={k} {cond}: F1 drop={f1_drop:.1f}%  "
-                    f"Hall drop={hall_drop:.1f}%  "
+                    f"Faith drop={faith_drop:.1f}%  "
                     f"H1={'SUPPORTED' if asymmetric else 'NOT supported'}"
                 )
 
     write_csv(
         os.path.join(args.output_dir, "h1_degradation.csv"),
         ["dataset","k","condition","fp16_f1","fp16_hall","cond_f1","cond_hall",
-         "f1_drop_pct","hall_drop_pct","h1_supported"],
+         "f1_drop_pct","faith_drop_pct","h1_supported"],
         h1_rows
     )
     report_lines.append("")
+
+    # Minimum gap threshold to avoid noise-level false positives (used by H2 and H3).
+    MIN_GAP = 0.02
 
     # ──────────────────────────────────────────────────────────────────────────
     # H2: Multi-Chunk Amplification  δK = Hall(INT4,K) − Hall(FP16,K)
@@ -198,10 +201,10 @@ def main():
             d3 = delta_k[3]
             d5 = delta_k[5]
 
-            # Direction guard:
-            # All gaps must be positive before claiming amplification.
-            h2_3_supported = (d1 > 0) and (d3 > 0) and (d3 > 3 * d1)
-            h2_5_supported = (d1 > 0) and (d5 > 0) and (d5 > 5 * d1)
+            # Direction guard + minimum gap guard:
+            # Gaps must be positive and above noise level before claiming amplification.
+            h2_3_supported = (d1 > 0) and (d3 > MIN_GAP) and (d3 > 3 * d1)
+            h2_5_supported = (d1 > 0) and (d5 > MIN_GAP) and (d5 > 5 * d1)
 
             report_lines.append(
                 f"  {ds:12s}  "
@@ -223,7 +226,7 @@ def main():
     # ──────────────────────────────────────────────────────────────────────────
     h3_rows = []
 
-    MIN_GAP = 0.02  # do not declare H3 from tiny noise-level differences
+
 
     report_lines.append("H3 – Task Complexity (expected: NQ-Open < HotpotQA < RGB)")
     report_lines.append("-" * 70)
@@ -417,7 +420,7 @@ def main():
     # Figure 1: F1 drop vs faithfulness drop by precision (averaged over all ds+k)
     fig1 = []
     for cond in ["C1", "C2", "C3"]:
-        f1_drops, hall_drops = [], []
+        f1_drops, faith_drops = [], []
         for ds in datasets:
             for k in k_values:
                 base = get_row(data, ds, k, "C1")
@@ -425,7 +428,7 @@ def main():
                 if base is None or row is None:
                     continue
                 f1_drops.append(relative_drop(safe_float(base["F1"]), safe_float(row["F1"])))
-                hall_drops.append(relative_drop(
+                faith_drops.append(relative_drop(
                     1 - safe_float(base["hallucination_rate"]),
                     1 - safe_float(row["hallucination_rate"])
                 ))
@@ -433,11 +436,11 @@ def main():
             fig1.append({
                 "condition":             cond,
                 "avg_relative_f1_drop":  round(sum(f1_drops)  / len(f1_drops),  2),
-                "avg_relative_hall_drop": round(sum(hall_drops)/ len(hall_drops), 2),
+                "avg_relative_faith_drop": round(sum(faith_drops)/ len(faith_drops), 2),
             })
     write_csv(
         os.path.join(args.output_dir, "figure1_data.csv"),
-        ["condition", "avg_relative_f1_drop", "avg_relative_hall_drop"],
+        ["condition", "avg_relative_f1_drop", "avg_relative_faith_drop"],
         fig1
     )
 

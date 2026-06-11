@@ -147,8 +147,8 @@ def config_to_evaluate_args(cfg: SimpleNamespace) -> list[str]:
     args += ["--question_fields"] + question_fields
     args += ["--answer_fields"]   + answer_fields
     args += ["--query_files"]     + query_files
-    # Use the first dataset's num_examples (they're equal in the MVE case)
-    args += ["--num_examples", n_ex_list[0]]
+    # Pass per-dataset num_examples (evaluate.py pads if fewer values than datasets)
+    args += ["--num_examples"] + n_ex_list
 
     args += ["--k_values"] + [str(k) for k in cfg.k_values]
     args += ["--conditions"] + cfg.conditions

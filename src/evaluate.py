@@ -198,10 +198,7 @@ def generate_with_cache(
             suffix        = build_query_suffix(query)
             new_input_ids = tokenizer.encode(suffix, return_tensors="pt").to(device)
             cached_len    = past_kvcache.get_seq_length()
-            cache_position = torch.arange(
-                cached_len, cached_len + new_input_ids.shape[1],
-                device=device
-            )
+
             attention_mask = torch.ones(
                 1, cached_len + new_input_ids.shape[1],
                 device=device, dtype=torch.long
@@ -211,7 +208,6 @@ def generate_with_cache(
                 max_new_tokens=MAX_NEW_TOKENS,
                 past_key_values=past_kvcache,
                 attention_mask=attention_mask,
-                cache_position=cache_position,
                 pad_token_id=tokenizer.eos_token_id,
                 do_sample=False,
                 eos_token_id=EOS_TOKEN_IDS,
@@ -433,8 +429,8 @@ def main():
     parser.add_argument("--query_files",    type=str, nargs="+", default=[],
                         help="JSONL path per dataset; used when hf_names entry is empty")
 
-    parser.add_argument("--num_examples",       type=int, default=200,
-                        help="-1 = use all")
+    parser.add_argument("--num_examples",       type=int, nargs="+", default=[200],
+                        help="Per-dataset example count (-1 = use all)")
     parser.add_argument("--k_values",           type=int, nargs="+", default=[1, 3, 5])
     parser.add_argument("--conditions",         type=str, nargs="+",
                         default=["C0", "C1", "C2", "C3"],
@@ -461,6 +457,7 @@ def main():
     question_fields = _pad(args.question_fields,  "question")
     answer_fields   = _pad(args.answer_fields,    "answer")
     query_files     = _pad(args.query_files,      "")
+    num_examples_list = _pad(args.num_examples,   200)
 
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -508,15 +505,15 @@ def main():
     all_records  = []
     summary_rows = []
 
-    for ds_name, qfile, hf_name, hf_cfg, hf_split, q_field, a_field in zip(
+    for ds_name, qfile, hf_name, hf_cfg, hf_split, q_field, a_field, n_examples in zip(
         args.datasets, query_files, hf_names, hf_configs,
-        hf_splits, question_fields, answer_fields,
+        hf_splits, question_fields, answer_fields, num_examples_list,
     ):
         log.info(f"\n{'='*60}\nDataset: {ds_name}\n{'='*60}")
         examples = load_dataset_examples(
             dataset_name=ds_name,
             query_file=qfile,
-            num_examples=args.num_examples,
+            num_examples=n_examples,
             hf_name=hf_name or None,
             hf_config=hf_cfg or None,
             hf_split=hf_split,

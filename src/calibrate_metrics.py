@@ -52,8 +52,7 @@ def main():
     records = records[:args.n_calibration]
     print(f"Calibration set: {len(records)} examples (condition={args.condition})")
 
-    # contexts = [r["context"]    for r in records]
-    # answers  = [r["prediction"] for r in records]
+
 
     # ── Score ──
     print("Loading HHEM …")
@@ -67,13 +66,8 @@ def main():
     print("Loading DeBERTa-NLI …")
     nli    = DeBERTaNLIScorer(device=device)
     
-    # FIX: use 512 tokens (matches FIX-3 in evaluate.py; DeBERTa's full window)
-    nli_contexts = [
-        trim_context_for_hhem(c, max_tokens=512)
-        for c in contexts
-    ]
-    nli_scores  = nli.batch_score(nli_contexts, answers)
-    # nli_scores  = nli.batch_score(contexts, answers)
+    # contexts are already trimmed to 512 tokens by trim_context_for_hhem above.
+    nli_scores  = nli.batch_score(contexts, answers)
 
     ent_scores  = [e for e, _, _ in nli_scores]
 
