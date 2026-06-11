@@ -120,192 +120,95 @@ def build_query_suffix(query: str) -> str:
 # KV cache stitching  (FIX-ROOT + FIX-SEEN + FIX-2LAYER + FIX-VERCHECK)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _normalise_legacy(legacy_cache, from_dynamic_cache: bool = False):
+def _normalise_legacy(legacy_cache):
     """
-    Normalise any legacy cache to a list of per-layer (k, v) pairs.
+    Normalise any legacy cache (from disk) to a list of per-layer (k, v) pairs.
 
-    Args:
-        legacy_cache: from DynamicCache.to_legacy_cache() or torch.load from disk.
-        from_dynamic_cache: True when the source is DynamicCache.to_legacy_cache().
-            This flag is the ONLY reliable disambiguator for 2-layer models.
+    Disk caches from decompress_kvcache are always old per-layer format:
+        ((k0,v0), (k1,v1), ..., (kL-1,vL-1))   len == L
 
-    Why the flag is necessary (FIX-2LAYER):
-        transformers>=4.45 new format: ((k0,k1,...,kL-1), (v0,v1,...,vL-1))  len==2
-        Old per-layer format:          ((k0,v0),(k1,v1),...,(kL-1,vL-1))     len==L
-        For L==2 both have len==2 with tensors at [0][0], so shape probing fails.
-        The caller always knows the source, so we require it to pass that explicitly.
+    But caches saved on transformers 4.45/4.46 could be new format:
+        ((k0,k1,...,kL-1), (v0,v1,...,vL-1))     len == 2
 
-    Returns:
-        list of (k_tensor, v_tensor) tuples, one per layer.
+    We detect both and always return: list of (k_tensor, v_tensor) tuples.
     """
-    if from_dynamic_cache:
-        # DynamicCache.to_legacy_cache() on 4.45/4.46 returns new format.
-        # On 4.47+ it reverts to old per-layer format — but we call
-        # _normalise_legacy here only in stack_past_key_values which calls
-        # to_legacy_cache(). We detect both cases correctly:
+    if len(legacy_cache) == 2:
+        inner0 = legacy_cache[0]
         if (
-            len(legacy_cache) == 2
-            and hasattr(legacy_cache[0], "__len__")
-            and len(legacy_cache[0]) > 0
-            and isinstance(legacy_cache[0][0], torch.Tensor)
-            # Distinguish: in new format legacy_cache[0] is the all-keys tuple (len==L);
-            # in old format legacy_cache[0] is (k0, v0) — a pair.
-            # We check that legacy_cache[0][0] and legacy_cache[1][0] are both tensors
-            # AND the inner length is > 1 element per slot (new format has L keys/values).
-            # For old format with L==2: legacy_cache[0] == (k0,v0), len==2, inner[0] is tensor.
-            # For new format with L==2: legacy_cache[0] == (k0,k1), len==2, inner[0] is tensor.
-            # These are truly ambiguous from shape alone — hence the flag.
+            hasattr(inner0, "__len__")
+            and len(inner0) > 2
+            and isinstance(inner0[0], torch.Tensor)
         ):
-            # If from_dynamic_cache=True, trust the caller: it IS new format.
-            # (4.47+ to_legacy_cache reverts to old format — see _legacy_fmt_is_new below)
-            if _legacy_fmt_is_new():
-                all_keys, all_values = legacy_cache
-                return list(zip(all_keys, all_values))
-            else:
-                # 4.47+ to_legacy_cache returns old per-layer format again.
-                return list(legacy_cache)
-        log.warning("from_dynamic_cache=True but unexpected structure; falling back.")
+            # New format: ((all_keys), (all_values))
+            all_keys, all_values = legacy_cache
+            return list(zip(all_keys, all_values))
+        # Old format with exactly 2 layers: [(k0,v0), (k1,v1)]
         return list(legacy_cache)
-
-    # ── Disk-loaded cache: always old per-layer format ──────────────────────
-    if len(legacy_cache) != 2:
-        # L != 2: len==L unambiguously means old per-layer format.
-        return list(legacy_cache)
-
-    # len==2 on disk: could be new format saved from 4.45/4.46, or old 2-layer format.
-    inner0 = legacy_cache[0]
-    if (
-        hasattr(inner0, "__len__")
-        and len(inner0) > 2  # all-keys tuple has L>2 elements
-        and isinstance(inner0[0], torch.Tensor)
-    ):
-        # New format saved to disk (uncommon but valid).
-        all_keys, all_values = legacy_cache
-        return list(zip(all_keys, all_values))
-
-    # 2-layer old per-layer format: treat as [(k0,v0),(k1,v1)].
+    # Old format with L != 2 layers
     return list(legacy_cache)
 
 
-def _to_new_legacy_format(per_layer_pairs):
+def _build_dynamic_cache(per_layer_pairs) -> DynamicCache:
     """
-    Convert per-layer (k, v) pairs → new ((k0,k1,...), (v0,v1,...)) format.
-    Required by DynamicCache.from_legacy_cache on transformers 4.45–4.46.
+    Build a DynamicCache by directly populating key_cache/value_cache lists.
+
+    This completely bypasses DynamicCache.from_legacy_cache() which has
+    format differences across transformers versions (4.44 old, 4.45-4.46 new,
+    4.47+ old again) and causes cache_position crashes in generate().
+
+    DynamicCache.key_cache and .value_cache are simple Python lists of tensors
+    on ALL transformers versions — this is the only stable API.
     """
-    all_keys   = tuple(kv[0] for kv in per_layer_pairs)
-    all_values = tuple(kv[1] for kv in per_layer_pairs)
-    return (all_keys, all_values)
-
-
-def _legacy_fmt_is_new() -> bool:
-    """
-    FIX-VERCHECK: detect which format from_legacy_cache expects at runtime.
-
-    transformers 4.45–4.46 → expects ((k0,...,kL-1), (v0,...,vL-1))  [new format]
-    transformers 4.44 and 4.47+ → expects ((k0,v0),(k1,v1),...)       [old format]
-
-    Parsing the version string defensively to handle pre-release suffixes
-    like "4.47.0.dev0" or "4.46.1".
-    """
-    try:
-        parts = transformers.__version__.split(".")
-        major, minor = int(parts[0]), int(parts[1])
-    except (ValueError, IndexError):
-        # Unparseable version — assume old format (safe default).
-        log.warning(f"Cannot parse transformers version '{transformers.__version__}'; "
-                    "assuming old-format from_legacy_cache.")
-        return False
-    return (major == 4) and (minor in (45, 46))
-
-
-def _set_seen_tokens(cache: DynamicCache) -> DynamicCache:
-    """
-    FIX-SEEN: transformers 4.45–4.47 does not update _seen_tokens in
-    from_legacy_cache. Patch it from the key tensor shape so
-    get_seq_length() returns the correct value.
-    """
-    if hasattr(cache, "key_cache") and len(cache.key_cache) > 0:
-        cache._seen_tokens = cache.key_cache[0].shape[2]  # (batch, heads, seq, head_dim)
+    cache = DynamicCache()
+    for k_tensor, v_tensor in per_layer_pairs:
+        cache.key_cache.append(k_tensor)
+        cache.value_cache.append(v_tensor)
+    # Patch _seen_tokens from actual tensor shape (FIX-SEEN)
+    if cache.key_cache:
+        cache._seen_tokens = cache.key_cache[0].shape[2]
     return cache
 
 
-def _safe_from_legacy_cache(per_layer_pairs):
+def legacy_to_dynamic(legacy) -> DynamicCache:
     """
-    FIX-SAFECACHE: Build a DynamicCache from per-layer (k,v) pairs.
+    Convert a disk-loaded legacy cache to a DynamicCache.
 
-    Tries the expected format first (based on transformers version).
-    If from_legacy_cache produces an empty DynamicCache despite non-empty input,
-    falls back to the other format.  This guards against version-detection
-    errors and future transformers releases.
+    Normalises the legacy format to per-layer (k, v) pairs, then directly
+    populates the DynamicCache — no from_legacy_cache() call needed.
     """
-    if not per_layer_pairs:
-        log.warning("_safe_from_legacy_cache called with empty per_layer_pairs")
-        return _set_seen_tokens(DynamicCache())
-
-    use_new = _legacy_fmt_is_new()
-    fmt = _to_new_legacy_format(per_layer_pairs) if use_new else tuple(per_layer_pairs)
-    cache = DynamicCache.from_legacy_cache(fmt)
-
-    # Verify it actually populated — if not, try the other format
-    if hasattr(cache, "key_cache") and len(cache.key_cache) == 0:
-        log.warning(
-            "from_legacy_cache produced empty cache with %s format; "
-            "trying %s format as fallback.",
-            "new" if use_new else "old",
-            "old" if use_new else "new",
-        )
-        fmt = tuple(per_layer_pairs) if use_new else _to_new_legacy_format(per_layer_pairs)
-        cache = DynamicCache.from_legacy_cache(fmt)
-
-    return _set_seen_tokens(cache)
-
-
-def legacy_to_dynamic(legacy, from_dynamic_cache: bool = False) -> DynamicCache:
-    """
-    Convert a legacy cache (disk or live DynamicCache) to a DynamicCache.
-
-    FIX-ROOT + FIX-2LAYER + FIX-VERCHECK: normalise to per-layer pairs first,
-    then build the format that the installed transformers version expects.
-    FIX-SEEN: patch _seen_tokens immediately after construction.
-    FIX-SAFECACHE: auto-detect format with fallback.
-    """
-    per_layer = _normalise_legacy(legacy, from_dynamic_cache=from_dynamic_cache)
-    return _safe_from_legacy_cache(per_layer)
+    per_layer = _normalise_legacy(legacy)
+    return _build_dynamic_cache(per_layer)
 
 
 def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCache:
     """
     Concatenate a list of DynamicCache objects along the sequence dimension.
 
-    FIX-VERCHECK: builds the correct format for the installed transformers version.
-    FIX-2LAYER: uses from_dynamic_cache=True when source is a live DynamicCache.
+    Directly reads from key_cache/value_cache lists and builds a new
+    DynamicCache.  No to_legacy_cache()/from_legacy_cache() round-trip.
     """
-    legacy_list = []
-    for c in past_key_values_list:
-        if hasattr(c, "to_legacy_cache"):
-            raw = c.to_legacy_cache()
-            legacy_list.append(_normalise_legacy(raw, from_dynamic_cache=True))
-        else:
-            legacy_list.append(_normalise_legacy(c, from_dynamic_cache=False))
+    first = past_key_values_list[0]
+    num_layers = len(first.key_cache)
 
-    num_layers = len(legacy_list[0])
     if num_layers == 0:
         log.error(
-            "stack_past_key_values: num_layers=0 — all caches are empty. "
-            "This usually means from_legacy_cache received the wrong format. "
-            "legacy_list sizes: %s",
-            [len(c) for c in legacy_list],
+            "stack_past_key_values: first cache has 0 layers. "
+            "key_cache lengths: %s",
+            [len(c.key_cache) for c in past_key_values_list],
         )
-        return _set_seen_tokens(DynamicCache())
+        return DynamicCache()
 
-    stacked_pairs = [
-        (
-            torch.cat([c[layer][0] for c in legacy_list], dim=2),
-            torch.cat([c[layer][1] for c in legacy_list], dim=2),
+    stacked_pairs = []
+    for layer in range(num_layers):
+        stacked_k = torch.cat(
+            [c.key_cache[layer] for c in past_key_values_list], dim=2
         )
-        for layer in range(num_layers)
-    ]
-    return _safe_from_legacy_cache(stacked_pairs)
+        stacked_v = torch.cat(
+            [c.value_cache[layer] for c in past_key_values_list], dim=2
+        )
+        stacked_pairs.append((stacked_k, stacked_v))
+
+    return _build_dynamic_cache(stacked_pairs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -535,8 +438,8 @@ def run_query(
             except Exception:
                 compressed = torch.load(fpath, weights_only=False)
             legacy     = decompress_kvcache(compressed, precision)
-            # Disk-loaded → from_dynamic_cache=False (always old per-layer format)
-            kvcache_list.append(legacy_to_dynamic(legacy, from_dynamic_cache=False))
+            # Disk-loaded caches are always old per-layer format
+            kvcache_list.append(legacy_to_dynamic(legacy))
             chunk_texts.append(node.metadata.get("raw_text", node.text))
             kv_size_bytes += cache_size_bytes(compressed, precision)
 
@@ -654,7 +557,7 @@ def main():
         "--similarity_top_k must be >= max(k_values)"
 
     log.info(f"transformers version: {transformers.__version__}  "
-             f"(from_legacy_cache expects {'NEW' if _legacy_fmt_is_new() else 'OLD'} format)")
+             f"(using direct DynamicCache population — no from_legacy_cache)")
 
     n_ds = len(args.datasets)
     def _pad(lst, default):
@@ -696,7 +599,8 @@ def main():
         )
     prefix_kvcache = prefix_out.past_key_values
     # Defensive: ensure _seen_tokens is correct even for the prefix cache.
-    _set_seen_tokens(prefix_kvcache)
+    if hasattr(prefix_kvcache, "key_cache") and len(prefix_kvcache.key_cache) > 0:
+        prefix_kvcache._seen_tokens = prefix_kvcache.key_cache[0].shape[2]
 
     log.info("Loading retrieval index ...")
     Settings.embed_model = HuggingFaceEmbedding(model_name=args.embedding_model_name)
