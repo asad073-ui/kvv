@@ -59,7 +59,7 @@ class Qwen2ModifiedAttention(Qwen2Attention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:  # ← return type fixed
 
         bsz, q_len, _ = hidden_states.size()
 
@@ -134,7 +134,11 @@ class Qwen2ModifiedAttention(Qwen2Attention):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights
+        # ── FIX: return past_key_values as 3rd element ──
+        # Qwen2DecoderLayer.forward unpacks all 3 values from the attention return.
+        # Without this, past_key_values never propagates out of the model forward,
+        # so prefix_out.past_key_values has seq_length=0 → all C1/C2/C3 crash.
+        return attn_output, attn_weights, past_key_values  # ← THE FIX
 
 
 class Qwen2ModifiedDecoderLayer(Qwen2DecoderLayer):

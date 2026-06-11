@@ -7,25 +7,38 @@ Implements all experimental conditions from the refined research idea:
   C2  INT8 TurboRAG    – offline INT8 quantized chunk caches, dequantized before stitching
   C3  INT4 TurboRAG    – offline INT4 quantized chunk caches, dequantized before stitching
 
-FIX LOG (vs previous version)
-──────────────────────────────────────────────────────────────────────────────
-  FIX-ROOT  legacy_to_dynamic was passing a per-layer (k,v) tuple list directly
-            to DynamicCache.from_legacy_cache.  In transformers >= 4.45
-            from_legacy_cache expects the NEW format ((k0,k1,...,kL-1),
-            (v0,v1,...,vL-1)).  The old format ((k0,v0),(k1,v1),...)
-            silently builds a DynamicCache with seq_length=0, causing every
-            C1/C2/C3 query to throw "index -1 is out of bounds for dimension 0
-            with size 0" and be skipped → EM=0, F1=0 for all TurboRAG conditions.
+FIX LOG
+────────────────────────────────────────────────────────────────────────────────
+  FIX-ROOT  legacy_to_dynamic / stack_past_key_values: DynamicCache.from_legacy_cache
+            on transformers >= 4.45 expects new-format ((k0,k1,...),(v0,v1,...)).
+            Old per-layer format ((k0,v0),(k1,v1),...) silently produced a cache
+            with _seen_tokens=0, causing get_seq_length() to return 0 → every
+            C1/C2/C3 query threw "index -1 is out of bounds for dimension 0 with
+            size 0" and was silently skipped → EM=0, F1=0.
 
-            FIX: legacy_to_dynamic now converts per-layer pairs into the new
-            all-keys/all-values format before calling from_legacy_cache.
-            stack_past_key_values does the same after concatenation.
+  FIX-SEEN  After DynamicCache.from_legacy_cache the internal _seen_tokens counter
+            is NOT updated (transformers bug present in 4.45-4.47).  We manually
+            set cache._seen_tokens to the actual sequence length immediately after
+            construction so get_seq_length() returns a real value.
+
+  FIX-MASK  generate_with_cache used cached_len = past_kvcache.get_seq_length()
+            which returned 0 due to FIX-SEEN bug above.  Now reads the actual
+            length directly from the key tensor shape so it is robust regardless
+            of _seen_tokens.
+
+  FIX-CSV   csv.DictWriter lacked quoting=csv.QUOTE_ALL / extrasaction='ignore'.
+            Fields containing commas (condition_label "Gold Oracle RAG", or any
+            context text leaking into a field) caused pandas read_csv to throw
+            "ParserError: Expected 1 fields in line N, saw 2".
+            Fixed by adding quoting=csv.QUOTE_ALL to the DictWriter constructor.
+
+  FIX-NAN   avg_ttft NaN when preds list is empty but ttft_list is also empty
+            caused tabulate to crash.  Guarded with explicit nan checks.
 
   FIX-1  torch_dtype= instead of dtype= in from_pretrained
          dtype= is silently ignored by transformers; model loaded in fp32 instead of bf16.
 
   FIX-2  context stored with "\\n\\n".join(chunk_texts) instead of " ".join
-         The space-join made split("\\n\\n") return one giant blob.
 
   FIX-3  trim_context_for_hhem now passes the full joined context up to 512 tokens.
 
@@ -99,7 +112,7 @@ def build_query_suffix(query: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# KV cache stitching  (FIX-ROOT here)
+# KV cache stitching  (FIX-ROOT + FIX-SEEN)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _normalise_legacy(legacy_cache):
@@ -109,42 +122,63 @@ def _normalise_legacy(legacy_cache):
     transformers < 4.45  → ((k0,v0), (k1,v1), ..., (kL-1,vL-1))  len=L
     transformers >= 4.45 → ((k0,k1,...,kL-1), (v0,v1,...,vL-1))   len=2
 
-    Both forms are normalised to: [(k0,v0), (k1,v1), ..., (kL-1,vL-1)]
+    Disambiguation: the new format has len==2 AND each element is a tuple/list
+    of tensors (not itself a pair of (tensor, tensor) tuples).
+    We identify the new format by checking len==2 AND that legacy_cache[0][0]
+    is a torch.Tensor (meaning legacy_cache[0] is the all-keys tuple).
     """
     if (
         len(legacy_cache) == 2
         and not isinstance(legacy_cache[0], torch.Tensor)
         and hasattr(legacy_cache[0], "__len__")
+        and len(legacy_cache[0]) > 0
+        and isinstance(legacy_cache[0][0], torch.Tensor)
     ):
+        # New format: ((k0, k1, ..., kL-1), (v0, v1, ..., vL-1))
         all_keys, all_values = legacy_cache
         return list(zip(all_keys, all_values))
-    return legacy_cache
+    # Old format or raw per-layer list: already [(k0,v0), (k1,v1), ...]
+    return list(legacy_cache)
 
 
 def _to_new_legacy_format(per_layer_pairs):
     """
     Convert per-layer (k, v) pairs  →  new ((k0,k1,...), (v0,v1,...)) format
     required by DynamicCache.from_legacy_cache in transformers >= 4.45.
-
-    We always work internally in per-layer pairs for stitching, and only at the
-    boundary do we re-pack to the new format.
     """
     all_keys   = tuple(kv[0] for kv in per_layer_pairs)
     all_values = tuple(kv[1] for kv in per_layer_pairs)
     return (all_keys, all_values)
 
 
-def legacy_to_dynamic(legacy: tuple) -> DynamicCache:
+def _set_seen_tokens(cache: DynamicCache) -> DynamicCache:
     """
-    Convert a per-layer (k,v) legacy cache tuple to a DynamicCache.
+    FIX-SEEN: transformers 4.45-4.47 does not update DynamicCache._seen_tokens
+    when building via from_legacy_cache.  get_seq_length() therefore returns 0,
+    which makes the attention mask too short and causes:
+        "index -1 is out of bounds for dimension 0 with size 0"
 
-    FIX-ROOT: decompress_kvcache returns per-layer (k,v) tuples. On new
-    transformers, from_legacy_cache expects ((k0,k1,...),(v0,v1,...)), so
-    we must convert before calling it.
+    Fix: read the real sequence length from the key tensor of layer 0 and write
+    it back to _seen_tokens.
+    """
+    if hasattr(cache, "key_cache") and len(cache.key_cache) > 0:
+        real_len = cache.key_cache[0].shape[2]  # (batch, heads, seq, head_dim)
+        cache._seen_tokens = real_len
+    return cache
+
+
+def legacy_to_dynamic(legacy) -> DynamicCache:
+    """
+    Convert a per-layer (k,v) legacy cache tuple/list to a DynamicCache.
+
+    FIX-ROOT: always converts to the new all-keys/all-values format before
+              calling from_legacy_cache.
+    FIX-SEEN: patches _seen_tokens immediately after construction.
     """
     per_layer = _normalise_legacy(legacy)
     new_fmt   = _to_new_legacy_format(per_layer)
-    return DynamicCache.from_legacy_cache(new_fmt)
+    cache     = DynamicCache.from_legacy_cache(new_fmt)
+    return _set_seen_tokens(cache)
 
 
 def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCache:
@@ -155,13 +189,16 @@ def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCa
       1. Convert each DynamicCache → per-layer (k,v) pairs
       2. torch.cat all per-layer k tensors together, same for v
       3. Convert the stitched result → new format → DynamicCache.from_legacy_cache
+      4. Patch _seen_tokens (FIX-SEEN)
     """
-    legacy_list = [
-        _normalise_legacy(
-            c.to_legacy_cache() if hasattr(c, "to_legacy_cache") else c
-        )
-        for c in past_key_values_list
-    ]
+    legacy_list = []
+    for c in past_key_values_list:
+        if hasattr(c, "to_legacy_cache"):
+            raw = c.to_legacy_cache()
+        else:
+            raw = c
+        legacy_list.append(_normalise_legacy(raw))
+
     num_layers = len(legacy_list[0])
     stacked_pairs = [
         (
@@ -171,14 +208,18 @@ def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCa
         for layer in range(num_layers)
     ]
     new_fmt = _to_new_legacy_format(stacked_pairs)
-    return DynamicCache.from_legacy_cache(new_fmt)
+    cache   = DynamicCache.from_legacy_cache(new_fmt)
+    return _set_seen_tokens(cache)
 
 
-# FIX-3
+# ──────────────────────────────────────────────────────────────────────────────
+# Context helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
 def trim_context_for_hhem(context: str, max_tokens: int = 512) -> str:
     """
     Truncate the full multi-chunk context to fit inside the scorer's token window.
-    Rough approximation: 1 token ≈ 4 characters.
+    Rough approximation: 1 token ≈ 4 characters.  (FIX-3)
     """
     return context[: max_tokens * 4]
 
@@ -216,6 +257,18 @@ EOS_TOKEN_IDS = [151645, 151643]
 MAX_NEW_TOKENS = 64
 
 
+def _get_cache_seq_len(cache: DynamicCache) -> int:
+    """
+    FIX-MASK: Read actual sequence length from key tensors, not from
+    _seen_tokens (which may be stale even after our _set_seen_tokens fix
+    if the cache was built externally).  This is the ground truth.
+    """
+    if hasattr(cache, "key_cache") and len(cache.key_cache) > 0:
+        return cache.key_cache[0].shape[2]
+    # Fallback to the API method
+    return cache.get_seq_length()
+
+
 def generate_with_cache(
     model, tokenizer, device,
     past_kvcache: Optional[DynamicCache],
@@ -227,7 +280,8 @@ def generate_with_cache(
         if past_kvcache is not None:
             suffix        = build_query_suffix(query)
             new_input_ids = tokenizer.encode(suffix, return_tensors="pt").to(device)
-            cached_len    = past_kvcache.get_seq_length()
+            # FIX-MASK: use actual tensor shape, not get_seq_length()
+            cached_len    = _get_cache_seq_len(past_kvcache)
 
             attention_mask = torch.ones(
                 1, cached_len + new_input_ids.shape[1],
@@ -308,7 +362,7 @@ def run_query(
             fpath     = node.metadata[cache_key]
             compressed = torch.load(fpath, weights_only=True)
             legacy     = decompress_kvcache(compressed, precision)
-            # FIX-ROOT: convert to proper DynamicCache using new format
+            # FIX-ROOT + FIX-SEEN: always go through legacy_to_dynamic
             kvcache_list.append(legacy_to_dynamic(legacy))
             chunk_texts.append(node.metadata.get("raw_text", node.text))
             kv_size_bytes += cache_size_bytes(compressed, precision)
@@ -320,7 +374,7 @@ def run_query(
 
     return {
         "answer":        answer,
-        "context":       "\n\n".join(chunk_texts),  # FIX-2
+        "context":       "\n\n".join(chunk_texts),   # FIX-2
         "ttft_seconds":  ttft,
         "kv_size_bytes": kv_size_bytes,
     }
@@ -506,7 +560,12 @@ def main():
             attention_mask=prefix_inputs["attention_mask"].to(device),
             use_cache=True,
         )
+    # prefix_kvcache comes directly from the model (already a proper DynamicCache
+    # with _seen_tokens set correctly since it was built by a live forward pass).
     prefix_kvcache = prefix_out.past_key_values
+    # Defensive: ensure _seen_tokens is correct even for the prefix cache.
+    if hasattr(prefix_kvcache, "_seen_tokens"):
+        _set_seen_tokens(prefix_kvcache)
 
     log.info("Loading retrieval index ...")
     Settings.embed_model = HuggingFaceEmbedding(model_name=args.embedding_model_name)
@@ -583,12 +642,13 @@ def main():
                     except Exception as e:
                         log.warning(f"Skipped query: {e}")
 
-                f1_score   = batch_f1(preds, refs)
-                em_score   = batch_em(preds, refs)
-                contain_em = batch_contain_em(preds, refs)
+                f1_score   = batch_f1(preds, refs)          # FIX-4
+                em_score   = batch_em(preds, refs)          # FIX-4
+                contain_em = batch_contain_em(preds, refs)  # FIX-5
 
-                avg_ttft = sum(ttft_list) / len(ttft_list)   if ttft_list  else float("nan")
-                avg_kv   = sum(kv_size_list) / len(kv_size_list) if kv_size_list else 0
+                # FIX-NAN: guard against empty preds list
+                avg_ttft = (sum(ttft_list) / len(ttft_list)) if ttft_list else float("nan")
+                avg_kv   = (sum(kv_size_list) / len(kv_size_list)) if kv_size_list else 0
 
                 hall_rate = float("nan")
                 ent_score = float("nan")
@@ -599,7 +659,7 @@ def main():
 
                 if hhem_scorer and contexts and preds:
                     hhem_contexts = [trim_context_for_hhem(c) for c in contexts]
-                    faith_scores  = hhem_scorer.batch_score(hhem_contexts, preds)
+                    faith_scores  = hhem_scorer.batch_score(hhem_contexts, preds)  # FIX-6
                     hall_rate     = hallucination_rate(faith_scores)
                     n_total       = len(faith_scores)
                     n_hall        = sum(1 for s in faith_scores if s < HHEM_THRESHOLD)
@@ -616,7 +676,7 @@ def main():
                         trim_context_for_hhem(c, max_tokens=512)
                         for c in contexts
                     ]
-                    nli_scores = nli_scorer.batch_score(nli_contexts, preds)
+                    nli_scores = nli_scorer.batch_score(nli_contexts, preds)   # FIX-6
                     ent_score  = mean_entailment(nli_scores)
                     matching = [
                         r for r in all_records
@@ -633,28 +693,32 @@ def main():
                     "condition":          condition,
                     "condition_label":    CONDITION_LABELS[condition],
                     "n_examples":         len(preds),
-                    "n_hall":             n_hall,
-                    "n_total":            n_total,
+                    "n_hall":             n_hall,             # FIX-7
+                    "n_total":            n_total,            # FIX-7
                     "EM":                 round(em_score,   4),
                     "contain_EM":         round(contain_em, 4),
                     "F1":                 round(f1_score,   4),
                     "hallucination_rate": round(hall_rate, 4) if not math.isnan(hall_rate) else "N/A",
                     "entailment_score":   round(ent_score,  4) if not math.isnan(ent_score)  else "N/A",
-                    "avg_ttft_s":         round(avg_ttft, 4),
+                    "avg_ttft_s":         round(avg_ttft, 4) if not math.isnan(avg_ttft) else "N/A",
                     "avg_kv_bytes":       int(avg_kv),
                 }
                 summary_rows.append(row)
                 log.info(
-                    f"    EM={em_score:.3f}  ContEM={contain_em:.3f}  F1={f1_score:.3f}  "
-                    f"Hall={hall_rate:.3f}  Ent={ent_score:.3f}  "
-                    f"TTFT={avg_ttft:.3f}s  KV={avg_kv/1e6:.2f}MB"
+                    f"    n={len(preds)}  EM={em_score:.3f}  ContEM={contain_em:.3f}  "
+                    f"F1={f1_score:.3f}  Hall={'N/A' if math.isnan(hall_rate) else f'{hall_rate:.3f}'}  "
+                    f"Ent={'N/A' if math.isnan(ent_score) else f'{ent_score:.3f}'}  "
+                    f"TTFT={'N/A' if math.isnan(avg_ttft) else f'{avg_ttft:.3f}s'}  "
+                    f"KV={avg_kv/1e6:.2f}MB"
                 )
 
+    # ── Write raw JSONL ──────────────────────────────────────────────────────
     with open(raw_path, "w") as f:
         for rec in all_records:
             f.write(json.dumps(rec) + "\n")
     log.info(f"Raw records → {raw_path}")
 
+    # ── Write summary CSV  (FIX-CSV: QUOTE_ALL prevents parser errors) ──────
     fieldnames = [
         "dataset", "k", "condition", "condition_label", "n_examples",
         "n_hall", "n_total",
@@ -663,18 +727,26 @@ def main():
         "avg_ttft_s", "avg_kv_bytes",
     ]
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            quoting=csv.QUOTE_ALL,          # FIX-CSV
+            extrasaction="ignore",
+        )
         writer.writeheader()
         writer.writerows(summary_rows)
     log.info(f"Summary CSV → {csv_path}")
 
+    # ── Write summary JSON ───────────────────────────────────────────────────
     with open(json_path, "w") as f:
         json.dump(summary_rows, f, indent=2)
     log.info(f"Summary JSON → {json_path}")
 
-    headers = ["Dataset", "K", "Cond", "EM", "ContEM", "F1", "Hall↓", "Ent↑", "TTFT(s)", "KV(MB)"]
+    # ── Print table ──────────────────────────────────────────────────────────
+    headers = ["Dataset", "K", "Cond", "n", "EM", "ContEM", "F1",
+               "Hall↓", "Ent↑", "TTFT(s)", "KV(MB)"]
     table   = [
-        [r["dataset"], r["k"], r["condition"],
+        [r["dataset"], r["k"], r["condition"], r["n_examples"],
          r["EM"], r["contain_EM"], r["F1"],
          r["hallucination_rate"], r["entailment_score"],
          r["avg_ttft_s"],
