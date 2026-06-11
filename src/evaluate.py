@@ -428,9 +428,22 @@ def run_query(
         kvcache_list = [prefix_copy]
 
         for nws in nodes_k:
-            node       = nws.node
-            cache_key  = f"kvcache_{precision}"
-            fpath      = node.metadata[cache_key]
+            node      = nws.node
+            cache_key = f"kvcache_{precision}"
+
+            # FIX-GUARD: defensive check for missing build stage
+            if cache_key not in node.metadata:
+                raise KeyError(
+                    f"Node '{node.id_}' missing '{cache_key}'. "
+                    f"Did you run --stages build first? "
+                    f"Available keys: {list(node.metadata.keys())}"
+                )
+            fpath = node.metadata[cache_key]
+            if not os.path.exists(fpath):
+                raise FileNotFoundError(
+                    f"Cache file not found: '{fpath}'. Re-run --stages build."
+                )
+
             # FIX-TLOAD: compressed caches are dicts with mixed Python types
             # (str, list, bool) that weights_only=True rejects on PyTorch 2.6+.
             try:
@@ -454,8 +467,6 @@ def run_query(
         "ttft_seconds":  ttft,
         "kv_size_bytes": kv_size_bytes,
     }
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset loaders
 # ──────────────────────────────────────────────────────────────────────────────
