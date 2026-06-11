@@ -29,7 +29,7 @@ FIX LOG
   FIX-CSV       DictWriter quoting=QUOTE_ALL prevents pandas ParserError.
   FIX-NAN       avg_ttft NaN guard prevents tabulate crash on empty preds.
   FIX-1         torch_dtype= (not dtype=) in from_pretrained.
-  FIX-2         context joined with "\n\n".
+  FIX-2         context joined with "\\n\\n".
   FIX-3         trim_context_for_hhem uses full joined context up to 512 tokens.
   FIX-4         F1 computed on raw preds; EM on extracted short answer.
   FIX-5         batch_contain_em added.
@@ -50,11 +50,14 @@ FIX LOG
   FIX-GUARD     generate_with_cache: if stacked cache is empty (cached_len==0), fall
                 back to C0-style full-prompt generation instead of silently generating
                 a context-free answer that inflates C1/C2/C3 scores.
-  FIX-PREFIX    prefix_out.past_key_values is a raw tuple when Qwen2ModifiedForCausalLM
-                forward() does not wrap in DynamicCache. Converted immediately after
-                the prefix forward pass via legacy_to_dynamic() so stack_past_key_values
-                always receives DynamicCache objects — prevents AttributeError:
-                'tuple' object has no attribute 'key_cache' on C1/C2/C3.
+
+  FIX-CACHEPOS  generate_with_cache: pass cache_position explicitly to model.generate()
+                when using a pre-filled DynamicCache. Without it, transformers tries to
+                auto-compute cache_position from scratch, produces an empty tensor of
+                size 0, and crashes with:
+                  IndexError: index -1 is out of bounds for dimension 0 with size 0
+                in prepare_inputs_for_generation (utils.py line 388).
+                Fix: cache_position=torch.arange(cached_len, cached_len + new_len).
 """
 
 
@@ -101,9 +104,11 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
 log = logging.getLogger(__name__)
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Prompt construction
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 SYSTEM_PROMPT = (
     "<|im_start|>system\n"
@@ -115,20 +120,25 @@ SYSTEM_PROMPT = (
     "information in documents.'.<|im_end|><|im_start|>user\nDocs:"
 )
 
+
 QUERY_SUFFIX_TEMPLATE = "\n\nQuestion: {query}<|im_end|><|im_start|>assistant\n"
+
 
 
 def build_full_prompt(chunks: List[str], query: str) -> str:
     return SYSTEM_PROMPT + "".join(chunks) + QUERY_SUFFIX_TEMPLATE.format(query=query)
 
 
+
 def build_query_suffix(query: str) -> str:
     return QUERY_SUFFIX_TEMPLATE.format(query=query)
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # KV cache stitching  (FIX-ROOT + FIX-SEEN + FIX-2LAYER + FIX-VERCHECK)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _normalise_legacy(legacy_cache):
     """
@@ -158,6 +168,7 @@ def _normalise_legacy(legacy_cache):
     return list(legacy_cache)
 
 
+
 def _build_dynamic_cache(per_layer_pairs) -> DynamicCache:
     """
     Build a DynamicCache by directly populating key_cache/value_cache lists.
@@ -179,19 +190,17 @@ def _build_dynamic_cache(per_layer_pairs) -> DynamicCache:
     return cache
 
 
+
 def legacy_to_dynamic(legacy) -> DynamicCache:
     """
-    Convert a disk-loaded legacy cache (or raw tuple from model forward pass)
-    to a DynamicCache.
+    Convert a disk-loaded legacy cache to a DynamicCache.
 
     Normalises the legacy format to per-layer (k, v) pairs, then directly
     populates the DynamicCache — no from_legacy_cache() call needed.
-
-    Also used to convert prefix_kvcache when Qwen2ModifiedForCausalLM returns
-    a raw tuple instead of DynamicCache from its forward() pass (FIX-PREFIX).
     """
     per_layer = _normalise_legacy(legacy)
     return _build_dynamic_cache(per_layer)
+
 
 
 def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCache:
@@ -225,43 +234,40 @@ def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCa
     return _build_dynamic_cache(stacked_pairs)
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Context helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def trim_context_for_hhem(context: str, max_tokens: int = 512) -> str:
     """Truncate context to fit inside the scorer's token window. (FIX-3)"""
     return context[: max_tokens * 4]
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Accuracy helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 # FIX-NORMDUP: _normalize_answer is now imported from metrics.py as
 # _normalize_answer (aliased from _normalize) to avoid duplicate
 # implementations that could silently diverge.
 
 
+
 def _extract_short_answer(text: str) -> str:
     """
     FIX-EXTRACT: Pull a short answer span from a free-form generation.
-
-    The model outputs multi-sentence explanations; EM against a gold span like
-    "Paris" will always be 0 on raw text.  This heuristic extracts the likely
-    answer span so EM is meaningful.
 
     Used ONLY for EM computation.  F1, HHEM, and NLI intentionally keep raw
     preds because they reward partial matches / faithfulness of the full response.
 
     Strategy (multi-tier, from most to least specific):
       1. Explicit answer markers: "the answer is", "answer is", "answer:"
-         — high confidence, take the span after the marker.
       2. First sentence: most QA models front-load the answer.
       3. First N words: last resort for single-phrase outputs.
-
-    REMOVED: greedy markers " is ", " was ", " are ", " were " which matched
-    mid-sentence and produced wrong spans (Bug 4 — primary cause of EM ≈ 0).
     """
     text = text.strip()
     if not text:
@@ -281,23 +287,22 @@ def _extract_short_answer(text: str) -> str:
         idx = lower.find(marker)
         if idx != -1:
             span = text[idx + len(marker):]
-            # Trim at first sentence boundary, comma, or semicolon.
             for sep in ('.', ',', ';', '\n'):
                 span = span.split(sep)[0]
             span = span.strip().rstrip('.')
             if 1 <= len(span.split()) <= 12:
                 return span
 
-    # ── Tier 2: first sentence (most QA models front-load the answer) ──
-    # Split on period followed by space (avoids splitting on "U.S." etc.)
+    # ── Tier 2: first sentence ──
     sentences = re.split(r'(?<=\w)\.\s', text, maxsplit=1)
     first_sent = sentences[0].strip().rstrip('.')
     if 1 <= len(first_sent.split()) <= 15:
         return first_sent
 
-    # ── Tier 3: first N words (last resort for very long first sentences) ──
+    # ── Tier 3: first N words ──
     words = text.split()
     return " ".join(words[:10]).rstrip(".,;:!?")
+
 
 
 def batch_contain_em(predictions: List[str], ground_truths: List[str]) -> float:
@@ -313,12 +318,15 @@ def batch_contain_em(predictions: List[str], ground_truths: List[str]) -> float:
     ) / len(predictions)
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Generation
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 EOS_TOKEN_IDS  = [151645, 151643]
 MAX_NEW_TOKENS = 64
+
 
 
 def _get_cache_seq_len(cache: DynamicCache) -> int:
@@ -326,6 +334,7 @@ def _get_cache_seq_len(cache: DynamicCache) -> int:
     if hasattr(cache, "key_cache") and len(cache.key_cache) > 0:
         return cache.key_cache[0].shape[2]
     return cache.get_seq_length()
+
 
 
 def generate_with_cache(
@@ -337,18 +346,14 @@ def generate_with_cache(
     """Generate an answer given either a stitched KV cache (C1-C3) or raw chunks (C0)."""
     with torch.no_grad():
         if past_kvcache is not None:
-            suffix         = build_query_suffix(query)
-            new_input_ids  = tokenizer.encode(suffix, return_tensors="pt").to(device)
-            cached_len     = _get_cache_seq_len(past_kvcache)
+            suffix        = build_query_suffix(query)
+            new_input_ids = tokenizer.encode(suffix, return_tensors="pt").to(device)
+            cached_len    = _get_cache_seq_len(past_kvcache)
 
-            # FIX-GUARD: if the stacked cache is empty (both format attempts failed
-            # in _safe_from_legacy_cache), do NOT run generate() with a broken empty
-            # cache — that produces a silently wrong context-free answer that would
-            # artificially inflate C1/C2/C3 scores. Fall back to C0-style generation.
+            # FIX-GUARD: if the stacked cache is empty fall back to C0-style.
             if cached_len == 0:
                 log.error(
                     "generate_with_cache: stacked cache is empty (cached_len=0). "
-                    "Both DynamicCache format attempts failed. "
                     "Falling back to C0-style full-prompt generation."
                 )
                 prompt    = build_full_prompt(chunks, query)
@@ -364,22 +369,48 @@ def generate_with_cache(
                 new_tokens = outputs[0][input_ids.shape[1]:]
                 return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
+            new_len = new_input_ids.shape[1]
+
             attention_mask = torch.ones(
-                1, cached_len + new_input_ids.shape[1],
+                1, cached_len + new_len,
                 device=device, dtype=torch.long,
             )
+
+            # ── FIX-CACHEPOS ────────────────────────────────────────────────
+            # transformers.generate() with a pre-filled DynamicCache REQUIRES
+            # an explicit cache_position tensor telling it where in the overall
+            # sequence the new input tokens sit.
+            #
+            # Without it, generate() tries to infer cache_position internally.
+            # The inference path calls get_seq_length() on the DynamicCache,
+            # which on some transformers versions returns 0 (or builds an empty
+            # tensor), leading to:
+            #
+            #   IndexError: index -1 is out of bounds for dimension 0 with size 0
+            #   in prepare_inputs_for_generation (utils.py line 388)
+            #
+            # Fix: pass cache_position=torch.arange(cached_len, cached_len + new_len)
+            # so generate() knows exactly where the suffix tokens start.
+            # ────────────────────────────────────────────────────────────────
+            cache_position = torch.arange(
+                cached_len, cached_len + new_len,
+                device=device, dtype=torch.long,
+            )
+
             outputs = model.generate(
                 new_input_ids,
                 max_new_tokens=MAX_NEW_TOKENS,
                 past_key_values=past_kvcache,
                 attention_mask=attention_mask,
+                cache_position=cache_position,      # FIX-CACHEPOS
                 pad_token_id=tokenizer.eos_token_id,
                 do_sample=False,
-                temperature=1.0,       # FIX-TEMP: suppress UserWarning
+                temperature=1.0,                    # FIX-TEMP
                 eos_token_id=EOS_TOKEN_IDS,
             )
-            new_tokens = outputs[0][new_input_ids.shape[1]:]
+            new_tokens = outputs[0][new_len:]
             return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
         else:
             prompt    = build_full_prompt(chunks, query)
             input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
@@ -388,16 +419,18 @@ def generate_with_cache(
                 max_new_tokens=MAX_NEW_TOKENS,
                 pad_token_id=tokenizer.eos_token_id,
                 do_sample=False,
-                temperature=1.0,       # FIX-TEMP: suppress UserWarning
+                temperature=1.0,                    # FIX-TEMP
                 eos_token_id=EOS_TOKEN_IDS,
             )
             new_tokens = outputs[0][input_ids.shape[1]:]
             return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-query inference for each condition
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 PRECISION_MAP = {"C0": None, "C1": "fp16", "C2": "int8", "C3": "int4"}
 CONDITION_LABELS = {
@@ -406,6 +439,7 @@ CONDITION_LABELS = {
     "C2": "INT8 TurboRAG",
     "C3": "INT4 TurboRAG",
 }
+
 
 
 def run_query(
@@ -445,7 +479,6 @@ def run_query(
             node      = nws.node
             cache_key = f"kvcache_{precision}"
 
-            # FIX-GUARD: defensive check for missing build stage
             if cache_key not in node.metadata:
                 raise KeyError(
                     f"Node '{node.id_}' missing '{cache_key}'. "
@@ -459,13 +492,11 @@ def run_query(
                 )
 
             # FIX-TLOAD: compressed caches are dicts with mixed Python types
-            # (str, list, bool) that weights_only=True rejects on PyTorch 2.6+.
             try:
                 compressed = torch.load(fpath, weights_only=True)
             except Exception:
                 compressed = torch.load(fpath, weights_only=False)
             legacy     = decompress_kvcache(compressed, precision)
-            # Disk-loaded caches are always old per-layer format
             kvcache_list.append(legacy_to_dynamic(legacy))
             chunk_texts.append(node.metadata.get("raw_text", node.text))
             kv_size_bytes += cache_size_bytes(compressed, precision)
@@ -486,6 +517,7 @@ def run_query(
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset loaders
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _load_from_hf(
     hf_name, hf_config, hf_split, num_examples,
@@ -522,6 +554,7 @@ def _load_from_hf(
     return examples
 
 
+
 def _load_from_jsonl(query_file: str, num_examples: int) -> List[Dict]:
     examples = []
     with open(query_file) as f:
@@ -537,6 +570,7 @@ def _load_from_jsonl(query_file: str, num_examples: int) -> List[Dict]:
     return examples
 
 
+
 def load_dataset_examples(
     dataset_name, query_file, num_examples,
     hf_name=None, hf_config=None, hf_split="validation",
@@ -550,9 +584,11 @@ def load_dataset_examples(
     raise ValueError(f"Dataset '{dataset_name}': provide either --hf_names or --query_files")
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main evaluation loop
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def main():
     parser = argparse.ArgumentParser(description="TurboRAG KV-cache quantization evaluation")
@@ -610,13 +646,11 @@ def main():
     attn_impl = "flash_attention_2" if args.use_flash_attn else "eager"
     log.info(f"Loading model: {args.model_name} (attn={attn_impl})")
 
-    # FIX-1: torch_dtype= is the correct kwarg; dtype= is silently ignored by
-    # from_pretrained and causes the model to load in float32, wasting 2× GPU
-    # memory and creating dtype mismatches with bfloat16 KV tensors from disk.
+    # FIX-1: torch_dtype= (not dtype=)
     model = Qwen2ModifiedForCausalLM.from_pretrained(
         args.model_name,
         attn_implementation=attn_impl,
-        torch_dtype=torch.bfloat16,   # FIX-1: torch_dtype=, NOT dtype=
+        torch_dtype=torch.bfloat16,
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
@@ -629,28 +663,6 @@ def main():
             use_cache=True,
         )
     prefix_kvcache = prefix_out.past_key_values
-
-    # ─── FIX-PREFIX ──────────────────────────────────────────────────────────
-    # Qwen2ModifiedForCausalLM.forward() may return past_key_values as a raw
-    # tuple-of-tuples instead of a DynamicCache, depending on the transformers
-    # version and whether the custom forward() in qwen2.py explicitly wraps it.
-    #
-    # If left as a tuple, stack_past_key_values crashes on:
-    #     first.key_cache   ← AttributeError: 'tuple' has no attribute 'key_cache'
-    #
-    # This kills ALL C1/C2/C3 predictions (0 results, no traceback in some
-    # versions). The fix: convert unconditionally if not already a DynamicCache.
-    # legacy_to_dynamic() already handles every tuple format correctly.
-    # ─────────────────────────────────────────────────────────────────────────
-    if not isinstance(prefix_kvcache, DynamicCache):
-        log.info(
-            "prefix_kvcache is %s — converting to DynamicCache via "
-            "legacy_to_dynamic() (FIX-PREFIX).",
-            type(prefix_kvcache).__name__,
-        )
-        prefix_kvcache = legacy_to_dynamic(prefix_kvcache)
-
-    # Defensive: ensure _seen_tokens is correct even for the prefix cache.
     if hasattr(prefix_kvcache, "key_cache") and len(prefix_kvcache.key_cache) > 0:
         prefix_kvcache._seen_tokens = prefix_kvcache.key_cache[0].shape[2]
 
@@ -713,20 +725,18 @@ def main():
                             "kv_bytes":   result["kv_size_bytes"],
                         })
                     except Exception as e:
-                        # FIX-ERRLOG: full traceback, never silent
+                        # FIX-ERRLOG
                         log.error(
                             f"Skipped query [{ds_name} K={k} {condition}]: {e}",
                             exc_info=True,
                         )
 
-                # FIX-EM / FIX-EXTRACT: EM uses extracted short answer spans.
-                # F1 keeps raw preds intentionally.
+                # FIX-EM: EM uses extracted short answer spans; F1 uses raw preds.
                 em_preds   = [_extract_short_answer(p) for p in preds]
-                f1_score   = batch_f1(preds, refs)          # raw
-                em_score   = batch_em(em_preds, refs)       # extracted
-                contain_em = batch_contain_em(preds, refs)  # FIX-5, raw (gold ⊆ pred)
+                f1_score   = batch_f1(preds, refs)
+                em_score   = batch_em(em_preds, refs)
+                contain_em = batch_contain_em(preds, refs)
 
-                # Debug: log first few extraction examples so users can verify
                 if preds and log.isEnabledFor(logging.DEBUG):
                     for i in range(min(3, len(preds))):
                         log.debug(
@@ -735,7 +745,7 @@ def main():
                             1 if _normalize_answer(em_preds[i]) == _normalize_answer(refs[i]) else 0,
                         )
 
-                # FIX-NAN: guard against empty preds
+                # FIX-NAN
                 avg_ttft = (sum(ttft_list) / len(ttft_list)) if ttft_list else float("nan")
                 avg_kv   = (sum(kv_size_list) / len(kv_size_list)) if kv_size_list else 0
 
@@ -747,11 +757,10 @@ def main():
 
                 if hhem_scorer and contexts and preds:
                     hhem_contexts = [trim_context_for_hhem(c) for c in contexts]
-                    faith_scores  = hhem_scorer.batch_score(hhem_contexts, preds)  # FIX-6
+                    faith_scores  = hhem_scorer.batch_score(hhem_contexts, preds)
                     hall_rate     = hallucination_rate(faith_scores)
                     n_total       = len(faith_scores)
                     n_hall        = sum(1 for s in faith_scores if s < HHEM_THRESHOLD)
-                    # FIX-HHEM-IDX: direct slice instead of O(n²) filter scan
                     matching = all_records[record_start_idx:]
                     for rec, fs in zip(matching, faith_scores):
                         rec["hhem_faithfulness"] = fs
@@ -759,9 +768,8 @@ def main():
 
                 if nli_scorer and contexts and preds:
                     nli_contexts = [trim_context_for_hhem(c, max_tokens=512) for c in contexts]
-                    nli_scores = nli_scorer.batch_score(nli_contexts, preds)  # FIX-6
+                    nli_scores = nli_scorer.batch_score(nli_contexts, preds)
                     ent_score  = mean_entailment(nli_scores)
-                    # FIX-HHEM-IDX: direct slice instead of O(n²) filter scan
                     matching = all_records[record_start_idx:]
                     for rec, ns in zip(matching, nli_scores):
                         rec["nli_entailment"]    = ns[0]
@@ -774,8 +782,8 @@ def main():
                     "condition":          condition,
                     "condition_label":    CONDITION_LABELS[condition],
                     "n_examples":         len(preds),
-                    "n_hall":             n_hall,    # FIX-7
-                    "n_total":            n_total,   # FIX-7
+                    "n_hall":             n_hall,
+                    "n_total":            n_total,
                     "EM":                 round(em_score,   4),
                     "contain_EM":         round(contain_em, 4),
                     "F1":                 round(f1_score,   4),
@@ -809,7 +817,7 @@ def main():
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f, fieldnames=fieldnames,
-            quoting=csv.QUOTE_ALL,   # FIX-CSV
+            quoting=csv.QUOTE_ALL,
             extrasaction="ignore",
         )
         writer.writeheader()
@@ -832,6 +840,7 @@ def main():
         for r in summary_rows
     ]
     print("\n" + tabulate(table, headers=headers, tablefmt="grid"))
+
 
 
 if __name__ == "__main__":
