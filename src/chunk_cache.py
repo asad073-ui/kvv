@@ -181,6 +181,30 @@ def load_local_documents(documents_dir: str) -> List[Document]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Helper: normalise DynamicCache.to_legacy_cache() output
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _to_per_layer_pairs(legacy_cache):
+    """
+    Normalise the output of DynamicCache.to_legacy_cache() to a sequence of
+    (key_tensor, value_tensor) pairs, one per transformer layer.
+
+    transformers<4.45  returned: ((k0,v0), (k1,v1), ...)   ← per-layer pairs
+    transformers>=4.45 returns:  ((k0,k1,...), (v0,v1,...)) ← 2-element tuple
+
+    Both formats are handled so the code is forward- and backward-compatible.
+    The new format is detected when the outer tuple has exactly 2 elements AND
+    the first element is not a Tensor (it is a tuple/list of tensors).
+    """
+    if len(legacy_cache) == 2 and not isinstance(legacy_cache[0], torch.Tensor):
+        # New format: (all_keys_tuple, all_values_tuple)
+        all_keys, all_values = legacy_cache
+        return list(zip(all_keys, all_values))
+    # Old format: sequence of (k, v) per-layer tuples — already correct
+    return legacy_cache
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Core: compute + save per-chunk KV caches
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -199,7 +223,11 @@ def compute_and_save_chunk(
     with torch.no_grad():
         outputs = model(**inputs, use_cache=True)
 
-    legacy_cache = outputs.past_key_values.to_legacy_cache()
+    # DynamicCache.to_legacy_cache() format changed in transformers>=4.45.
+    # _to_per_layer_pairs() normalises both old and new formats so that
+    # compress_kvcache always receives [(k0,v0), (k1,v1), ...].
+    raw_legacy   = outputs.past_key_values.to_legacy_cache()
+    legacy_cache = _to_per_layer_pairs(raw_legacy)
 
     paths = {}
     for prec in PRECISIONS:
