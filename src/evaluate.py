@@ -7,47 +7,37 @@ Implements all experimental conditions from the refined research idea:
   C2  INT8 TurboRAG    – offline INT8 quantized chunk caches, dequantized before stitching
   C3  INT4 TurboRAG    – offline INT4 quantized chunk caches, dequantized before stitching
 
-Questions are loaded from HuggingFace datasets (nq_open, hotpotqa) or from
-local JSONL files (rgb and any custom dataset). Pass --hf_names alongside
---datasets to select the source per dataset.
+FIX LOG (vs previous version)
+──────────────────────────────────────────────────────────────────────────────
+  FIX-ROOT  legacy_to_dynamic was passing a per-layer (k,v) tuple list directly
+            to DynamicCache.from_legacy_cache.  In transformers >= 4.45
+            from_legacy_cache expects the NEW format ((k0,k1,...,kL-1),
+            (v0,v1,...,vL-1)).  The old format ((k0,v0),(k1,v1),...)
+            silently builds a DynamicCache with seq_length=0, causing every
+            C1/C2/C3 query to throw "index -1 is out of bounds for dimension 0
+            with size 0" and be skipped → EM=0, F1=0 for all TurboRAG conditions.
 
-Outputs
-───────
-  results/results_<timestamp>.jsonl   – one record per (dataset, K, condition, example)
-  results/summary_<timestamp>.csv     – aggregated metrics table (main paper table)
-  results/summary_<timestamp>.json    – same, JSON format
+            FIX: legacy_to_dynamic now converts per-layer pairs into the new
+            all-keys/all-values format before calling from_legacy_cache.
+            stack_past_key_values does the same after concatenation.
 
-Fix log vs original repo
-────────────────────────
   FIX-1  torch_dtype= instead of dtype= in from_pretrained
          dtype= is silently ignored by transformers; model loaded in fp32 instead of bf16.
 
   FIX-2  context stored with "\\n\\n".join(chunk_texts) instead of " ".join
-         The space-join made split("\\n\\n") return one giant blob so
-         trim_context_for_hhem always saw only the first 1200 chars regardless of K.
+         The space-join made split("\\n\\n") return one giant blob.
 
-  FIX-3  trim_context_for_hhem now passes the full joined context up to 512 tokens
-         (≈2048 chars) instead of taking only the first chunk.  HHEM uses flan-T5-base
-         internally (512-token window); 512 tokens is the correct upper bound.
-         NLI calls also pass max_tokens=512 and rely on DeBERTa's built-in truncation.
+  FIX-3  trim_context_for_hhem now passes the full joined context up to 512 tokens.
 
   FIX-4  F1 and EM computed on raw preds, not on extract_short_answer(pred).
-         token_f1 already handles verbose output correctly (precision/recall overlap).
-         extract_short_answer was making F1 near-zero for refusal outputs.
 
-  FIX-5  Added contain_em metric: fraction of examples where the normalised gold
-         answer string is a substring of the normalised prediction.
-         Standard EM is always 0 for generative RAG; contain_em is the correct
-         accuracy signal used by NQ-Open and TriviaQA official evaluations.
+  FIX-5  Added contain_em metric.
 
-  FIX-6  HHEM and NLI scorers receive raw preds (not short_predictions).
+  FIX-6  HHEM and NLI scorers receive raw preds.
 
-  FIX-7  n_hall and n_total written to the summary row dict so that
-         analyze_results.py can run the proportions z-test for H3.
+  FIX-7  n_hall and n_total written to the summary row dict.
 
-  FIX-8  _load_from_hf uses a while loop for isinstance(a, list) unwrapping
-         so that nested structures like NQ-Open answers={'text':[...]} resolve
-         correctly to a plain string.
+  FIX-8  _load_from_hf uses a while loop for isinstance(a, list) unwrapping.
 """
 
 import os
@@ -109,37 +99,62 @@ def build_query_suffix(query: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# KV cache stitching
+# KV cache stitching  (FIX-ROOT here)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _normalise_legacy(legacy_cache):
     """
     Normalise DynamicCache.to_legacy_cache() output to per-layer (k, v) pairs.
 
-    transformers < 4.45  → ((k0,v0), (k1,v1), ..., (k23,v23))  len=24
-    transformers >= 4.45 → ((k0,k1,...,k23), (v0,v1,...,v23))   len=2
+    transformers < 4.45  → ((k0,v0), (k1,v1), ..., (kL-1,vL-1))  len=L
+    transformers >= 4.45 → ((k0,k1,...,kL-1), (v0,v1,...,vL-1))   len=2
 
-    Both forms are normalised to: [(k0,v0), (k1,v1), ..., (k23,v23)]
+    Both forms are normalised to: [(k0,v0), (k1,v1), ..., (kL-1,vL-1)]
     """
     if (
         len(legacy_cache) == 2
         and not isinstance(legacy_cache[0], torch.Tensor)
         and hasattr(legacy_cache[0], "__len__")
     ):
-        # New format: first element is a sequence of key tensors (not a single tensor)
         all_keys, all_values = legacy_cache
         return list(zip(all_keys, all_values))
-    # Old format: already a sequence of (key, value) per-layer tuples
     return legacy_cache
+
+
+def _to_new_legacy_format(per_layer_pairs):
+    """
+    Convert per-layer (k, v) pairs  →  new ((k0,k1,...), (v0,v1,...)) format
+    required by DynamicCache.from_legacy_cache in transformers >= 4.45.
+
+    We always work internally in per-layer pairs for stitching, and only at the
+    boundary do we re-pack to the new format.
+    """
+    all_keys   = tuple(kv[0] for kv in per_layer_pairs)
+    all_values = tuple(kv[1] for kv in per_layer_pairs)
+    return (all_keys, all_values)
+
+
+def legacy_to_dynamic(legacy: tuple) -> DynamicCache:
+    """
+    Convert a per-layer (k,v) legacy cache tuple to a DynamicCache.
+
+    FIX-ROOT: decompress_kvcache returns per-layer (k,v) tuples. On new
+    transformers, from_legacy_cache expects ((k0,k1,...),(v0,v1,...)), so
+    we must convert before calling it.
+    """
+    per_layer = _normalise_legacy(legacy)
+    new_fmt   = _to_new_legacy_format(per_layer)
+    return DynamicCache.from_legacy_cache(new_fmt)
 
 
 def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCache:
     """
     Concatenate a list of DynamicCache objects along the sequence dimension.
 
-    FIX: normalise to_legacy_cache() output before indexing so that both
-    transformers < 4.45 (per-layer pairs) and >= 4.45 (2-element tuple of
-    all-keys / all-values) are handled correctly.
+    Steps:
+      1. Convert each DynamicCache → per-layer (k,v) pairs
+      2. torch.cat all per-layer k tensors together, same for v
+      3. Convert the stitched result → new format → DynamicCache.from_legacy_cache
     """
     legacy_list = [
         _normalise_legacy(
@@ -148,33 +163,23 @@ def stack_past_key_values(past_key_values_list: List[DynamicCache]) -> DynamicCa
         for c in past_key_values_list
     ]
     num_layers = len(legacy_list[0])
-    stacked = tuple(
+    stacked_pairs = [
         (
             torch.cat([c[layer][0] for c in legacy_list], dim=2),
             torch.cat([c[layer][1] for c in legacy_list], dim=2),
         )
         for layer in range(num_layers)
-    )
-    return DynamicCache.from_legacy_cache(stacked)
+    ]
+    new_fmt = _to_new_legacy_format(stacked_pairs)
+    return DynamicCache.from_legacy_cache(new_fmt)
 
 
-def legacy_to_dynamic(legacy: tuple) -> DynamicCache:
-    return DynamicCache.from_legacy_cache(legacy)
-
-
-# FIX-3: max_tokens raised to 512 (HHEM's full window); function now truncates
-# the full joined context instead of silently taking only the first chunk.
+# FIX-3
 def trim_context_for_hhem(context: str, max_tokens: int = 512) -> str:
     """
     Truncate the full multi-chunk context to fit inside the scorer's token window.
-
-    Uses ALL K retrieved chunks (context is already '\\n\\n'-joined by run_query).
-    Rough approximation: 1 token ≈ 4 characters.  HHEM's internal flan-T5-base
-    tokenizer caps at 512 tokens; DeBERTa caps at 512 tokens.  Passing the full
-    512-token budget here and relying on each scorer's own truncation=True is safe
-    and correct.
+    Rough approximation: 1 token ≈ 4 characters.
     """
-    # FIX-3: do NOT split and take only [0]; pass the entire joined context.
     return context[: max_tokens * 4]
 
 
@@ -192,12 +197,8 @@ def _normalize_answer(text: str) -> str:
 
 def batch_contain_em(predictions: List[str], ground_truths: List[str]) -> float:
     """
-    FIX-5: Contain-EM  — fraction of examples where the normalised gold answer
+    Contain-EM — fraction of examples where the normalised gold answer
     is a substring of the normalised prediction.
-
-    This is the correct accuracy metric for open-domain generative RAG
-    (used by NQ-Open and TriviaQA official evaluations).  Standard exact-match
-    is always 0 for generative models that produce full sentences.
     """
     if not predictions:
         return 0.0
@@ -307,6 +308,7 @@ def run_query(
             fpath     = node.metadata[cache_key]
             compressed = torch.load(fpath, weights_only=True)
             legacy     = decompress_kvcache(compressed, precision)
+            # FIX-ROOT: convert to proper DynamicCache using new format
             kvcache_list.append(legacy_to_dynamic(legacy))
             chunk_texts.append(node.metadata.get("raw_text", node.text))
             kv_size_bytes += cache_size_bytes(compressed, precision)
@@ -318,8 +320,7 @@ def run_query(
 
     return {
         "answer":        answer,
-        # FIX-2: join with "\n\n" so trim_context_for_hhem can see all K chunks.
-        "context":       "\n\n".join(chunk_texts),
+        "context":       "\n\n".join(chunk_texts),  # FIX-2
         "ttft_seconds":  ttft,
         "kv_size_bytes": kv_size_bytes,
     }
@@ -362,14 +363,11 @@ def _load_from_hf(
         q = row.get(question_field) or row.get("question", "")
         a = row.get(answer_field)   or row.get("answer", "")
 
-        # FIX-8: use while loop so nested structures like nq_open
-        # answers={'text': ['Paris', ...], 'answer_start': [...]} fully unpack.
+        # FIX-8: peel nested list/dict structures until we get a plain string
         while isinstance(a, list):
             a = a[0] if a else ""
         if isinstance(a, dict):
-            # Some datasets (hotpotqa, nq_open) nest the answer inside a dict.
             a = a.get("text", "") or a.get("answer", "")
-            # After dict extraction it might still be a list.
             while isinstance(a, list):
                 a = a[0] if a else ""
 
@@ -436,11 +434,9 @@ def main():
     parser.add_argument("--embedding_model_name", type=str, default="BAAI/bge-small-en-v1.5")
     parser.add_argument("--storage_dir",          type=str, default="doc_emb")
 
-    # Dataset names (required, one per dataset)
     parser.add_argument("--datasets",       type=str, nargs="+",
                         default=["nq_open", "hotpotqa", "rgb"])
 
-    # HuggingFace dataset config (one entry per dataset, "" = use query_file fallback)
     parser.add_argument("--hf_names",        type=str, nargs="+", default=[],
                         help="HF dataset name per dataset ('' to use query_file instead)")
     parser.add_argument("--hf_configs",      type=str, nargs="+", default=[],
@@ -451,15 +447,12 @@ def main():
                         help="Question field name per dataset (default: question)")
     parser.add_argument("--answer_fields",   type=str, nargs="+", default=[],
                         help="Answer field name per dataset (default: answer)")
-    parser.add_argument("--hf_cache_dir",    type=str, default=None,
-                        help="HF datasets cache directory (default: HF_DATASETS_CACHE env var)")
+    parser.add_argument("--hf_cache_dir",    type=str, default=None)
 
-    # Local JSONL fallback (used when hf_name for that dataset is empty)
     parser.add_argument("--query_files",    type=str, nargs="+", default=[],
                         help="JSONL path per dataset; used when hf_names entry is empty")
 
-    parser.add_argument("--num_examples",       type=int, nargs="+", default=[200],
-                        help="Per-dataset example count (-1 = use all)")
+    parser.add_argument("--num_examples",       type=int, nargs="+", default=[200])
     parser.add_argument("--k_values",           type=int, nargs="+", default=[1, 3, 5])
     parser.add_argument("--conditions",         type=str, nargs="+",
                         default=["C0", "C1", "C2", "C3"],
@@ -474,7 +467,6 @@ def main():
     assert args.similarity_top_k >= max(args.k_values), \
         "--similarity_top_k must be >= max(k_values)"
 
-    # Pad per-dataset lists to len(datasets) so we can zip safely
     n_ds = len(args.datasets)
 
     def _pad(lst, default):
@@ -497,19 +489,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Device: {device}")
 
-    # ── Load LLM ──
     attn_impl = "flash_attention_2" if args.use_flash_attn else "eager"
     log.info(f"Loading model: {args.model_name} (attn={attn_impl})")
-    # FIX-1: torch_dtype= is the correct kwarg; dtype= is silently ignored by transformers.
     model     = Qwen2ModifiedForCausalLM.from_pretrained(
         args.model_name,
         attn_implementation=attn_impl,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,        # FIX-1
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    # ── Precompute system-prefix KV cache ──
-    log.info("Pre-computing system prefix KV cache …")
+    log.info("Pre-computing system prefix KV cache ...")
     prefix_inputs = tokenizer([SYSTEM_PROMPT], return_tensors="pt", padding=True)
     with torch.no_grad():
         prefix_out = model(
@@ -519,18 +508,15 @@ def main():
         )
     prefix_kvcache = prefix_out.past_key_values
 
-    # ── Load embedding model + index ──
-    log.info("Loading retrieval index …")
+    log.info("Loading retrieval index ...")
     Settings.embed_model = HuggingFaceEmbedding(model_name=args.embedding_model_name)
     storage_ctx = StorageContext.from_defaults(persist_dir=args.storage_dir)
     index       = load_index_from_storage(storage_ctx)
     retriever   = index.as_retriever(similarity_top_k=args.similarity_top_k)
 
-    # ── Optionally load faithfulness scorers ──
     hhem_scorer = HHEMScorer(device=device)       if args.eval_hhem else None
     nli_scorer  = DeBERTaNLIScorer(device=device) if args.eval_nli  else None
 
-    # ── Main evaluation ──
     all_records  = []
     summary_rows = []
 
@@ -597,78 +583,50 @@ def main():
                     except Exception as e:
                         log.warning(f"Skipped query: {e}")
 
-                # ── Aggregate metrics ──
-                # FIX-4: compute F1 and standard EM directly on raw preds.
-                # token_f1 uses precision/recall overlap — verbose output is handled
-                # correctly without any extraction step.
-                f1_score      = batch_f1(preds, refs)
-                em_score      = batch_em(preds, refs)
-
-                # FIX-5: contain_em is the correct accuracy metric for generative RAG.
-                # Standard EM is always 0 for sentence-length model outputs.
-                contain_em    = batch_contain_em(preds, refs)
+                f1_score   = batch_f1(preds, refs)
+                em_score   = batch_em(preds, refs)
+                contain_em = batch_contain_em(preds, refs)
 
                 avg_ttft = sum(ttft_list) / len(ttft_list)   if ttft_list  else float("nan")
                 avg_kv   = sum(kv_size_list) / len(kv_size_list) if kv_size_list else 0
 
                 hall_rate = float("nan")
                 ent_score = float("nan")
-                # FIX-7: initialise counts here so they appear in the row dict
-                # even when --eval_hhem is not passed.
                 n_hall  = 0
                 n_total = len(preds)
 
                 HHEM_THRESHOLD = 0.5
 
                 if hhem_scorer and contexts and preds:
-                    # FIX-3: full joined context (all K chunks), up to 512-token window.
                     hhem_contexts = [trim_context_for_hhem(c) for c in contexts]
-
-                    # FIX-6: pass raw preds, not extract_short_answer(pred).
-                    faith_scores = hhem_scorer.batch_score(hhem_contexts, preds)
-
-                    hall_rate = hallucination_rate(faith_scores)
-
-                    # FIX-7: compute counts for H3 proportions z-test.
-                    n_total = len(faith_scores)
-                    n_hall  = sum(1 for s in faith_scores if s < HHEM_THRESHOLD)
-
+                    faith_scores  = hhem_scorer.batch_score(hhem_contexts, preds)
+                    hall_rate     = hallucination_rate(faith_scores)
+                    n_total       = len(faith_scores)
+                    n_hall        = sum(1 for s in faith_scores if s < HHEM_THRESHOLD)
                     matching = [
                         r for r in all_records
-                        if r["dataset"] == ds_name
-                        and r["k"] == k
-                        and r["condition"] == condition
+                        if r["dataset"] == ds_name and r["k"] == k and r["condition"] == condition
                     ]
                     for rec, fs in zip(matching, faith_scores):
                         rec["hhem_faithfulness"] = fs
                         rec["hhem_hallucinated"] = fs < HHEM_THRESHOLD
 
                 if nli_scorer and contexts and preds:
-                    # FIX-3 / FIX-7: full context at 512 tokens; DeBERTa truncates
-                    # internally at max_length=512 — no data is lost beyond that limit.
                     nli_contexts = [
                         trim_context_for_hhem(c, max_tokens=512)
                         for c in contexts
                     ]
-
-                    # FIX-6: pass raw preds, not short_predictions.
                     nli_scores = nli_scorer.batch_score(nli_contexts, preds)
-
-                    ent_score = mean_entailment(nli_scores)
-
+                    ent_score  = mean_entailment(nli_scores)
                     matching = [
                         r for r in all_records
-                        if r["dataset"] == ds_name
-                        and r["k"] == k
-                        and r["condition"] == condition
+                        if r["dataset"] == ds_name and r["k"] == k and r["condition"] == condition
                     ]
                     for rec, ns in zip(matching, nli_scores):
                         rec["nli_entailment"]    = ns[0]
                         rec["nli_neutral"]       = ns[1]
                         rec["nli_contradiction"] = ns[2]
 
-                # FIX-7: n_hall and n_total are now written into the row dict so
-                # analyze_results.py can locate them for the proportions z-test.
                 row = {
                     "dataset":            ds_name,
                     "k":                  k,
@@ -692,7 +650,6 @@ def main():
                     f"TTFT={avg_ttft:.3f}s  KV={avg_kv/1e6:.2f}MB"
                 )
 
-    # ── Write outputs ──
     with open(raw_path, "w") as f:
         for rec in all_records:
             f.write(json.dumps(rec) + "\n")
