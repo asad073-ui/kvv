@@ -84,9 +84,14 @@ datasets:
     description:    "RAG robustness under noisy retrieval (tests H1, H3)"
 
 # ── Minimum Viable Experiment (override above for quick runs) ─────────────────
+# num_examples drives BOTH the eval question count AND the chunk-cache corpus
+# size (config.py passes it to --hotpotqa_num_examples), so this one number sets
+# the whole runtime.  20 is a fast Colab-T4 sanity pass (~10-15 min end-to-end):
+# enough to confirm the metrics come out sensible (C0/C1 faithful, C2/C3 worse).
+# Bump to 100+ for the real GPU run once the smoke pass looks correct.
 mve:
   enabled:      true                  # Colab smoke-check runs in MVE mode
-  num_examples: 100
+  num_examples: 20
   datasets:     ["hotpotqa"]          # single dataset for the Colab MVE
   k_values:     [1, 3, 5]
 

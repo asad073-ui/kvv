@@ -17,8 +17,13 @@ sentence-transformers>=2.6.0
 faiss-cpu>=1.7.4
 
 # -- Datasets / Faithfulness evaluation -----------------------------------------
-# HHEM-2.1-Open and DeBERTa-NLI are loaded via HuggingFace; no extra pip install.
+# HHEM-2.1-Open and DeBERTa-NLI are loaded via HuggingFace.
+# sentencepiece + protobuf are REQUIRED to load the DeBERTa-v3 (NLI) and
+# flan-t5 (HHEM) tokenizers; without them eval_nli/eval_hhem crash on a fresh
+# Colab runtime.
 datasets>=2.18.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
 
 # -- Statistics -----------------------------------------------------------------
 # proportions_ztest lives in statsmodels, NOT scipy. statsmodels is required for

@@ -10,6 +10,71 @@ In a TurboRAG-style precomputed RAG system, does offline chunk-level KV cache qu
 
 ---
 
+## ⚡ Run on Google Colab (T4) — fast sanity pass
+
+The repo ships configured for a **Minimum Viable Experiment** that runs end-to-end
+on a free Colab **T4** in roughly **10–15 minutes**. It builds the retrieval corpus
+from HotpotQA's own paragraphs (no Wikipedia download), then evaluates all four
+conditions (C0 Gold Oracle, C1 FP16, C2 INT8, C3 INT4) over K ∈ {1, 3, 5} with
+HHEM + DeBERTa-NLI faithfulness scoring. Everything is pinned to
+`transformers==4.51.3` and runs in **float16** (T4 has no native bfloat16).
+
+> Goal of this pass: confirm the metrics come out sensible — C0/C1 should be the
+> most faithful, C2 → C3 should degrade. Once that looks right, raise
+> `mve.num_examples` in `configs/experiment.yaml` (e.g. 100–200) and run on a
+> bigger GPU for paper-grade numbers.
+
+**1. Runtime → Change runtime type → T4 GPU.** Upload the repo (or
+`git clone`), then point Colab at its folder:
+
+```python
+%cd /content/hall_kvcache-master      # ← the uploaded/cloned repo folder
+```
+
+**2. Install dependencies** (this pins `transformers==4.51.3`; Colab keeps its
+pre-installed CUDA `torch`):
+
+```python
+!pip install -q -r requirements.txt
+# If Colab prints "RESTART RUNTIME", do Runtime → Restart session, then re-run %cd.
+```
+
+**3. Sanity-check the environment:**
+
+```python
+import torch, transformers
+print("GPU:", torch.cuda.get_device_name(0))
+print("transformers:", transformers.__version__)   # must be 4.51.3
+```
+
+**4. Run the full MVE** (build caches → evaluate → analyze). `SCRATCH_DIR` and
+`HF_HOME` default to `/content/...`, which is writable on Colab:
+
+```python
+!bash scripts/mve.sh
+```
+
+**5. View the metrics table:**
+
+```python
+import glob, pandas as pd
+csv = sorted(glob.glob('/content/turborag_quant/results/summary_*.csv'))[-1]
+df = pd.read_csv(csv)
+df[['dataset','k','condition','n_examples','refusal_rate','EM','F1',
+    'hallucination_rate','entailment_score']]
+```
+
+```python
+# Hypothesis report (H1 asymmetric degradation, H2 amplification, H3 complexity)
+print(open(sorted(glob.glob('/content/turborag_quant/analysis/report.txt'))[-1]).read())
+```
+
+> With only 20 examples the hypothesis tests will not be statistically powered
+> (that is expected for a smoke pass) — you are checking that the numbers are
+> *coherent*, not that H1/H2/H3 are "SUPPORTED".
+
+---
+
 ## Project Structure
 
 ```
@@ -158,9 +223,15 @@ export HF_HOME=/scratch/${USER}/hf_cache
 bash scripts/mve.sh
 ```
 
-Runs Stage 01 (build caches), Stage 02 (evaluate), Stage 04 (analyze) with
-`mve.num_examples=100` and `mve.datasets=[nq_open, hotpotqa]`.
-Caches are skipped if `$SCRATCH_DIR/doc_emb/` already exists.
+Runs Stage 01 (build caches), Stage 02 (evaluate), Stage 04 (analyze) with the
+`mve:` block in the YAML — by default `num_examples=20`, `datasets=[hotpotqa]`,
+`k_values=[1,3,5]`, conditions `C0–C3`. The retrieval corpus is built from the
+HotpotQA questions' own paragraphs, so no Wikipedia download is needed.
+
+The **first** run downloads the Qwen2.5-3B model (~6 GB) and the HotpotQA dataset
+(cached under `$HF_HOME`); subsequent stages in the same session reuse the cache.
+Each `mve.sh` invocation rebuilds the chunk caches + index from scratch (cheap at
+`num_examples=20`).
 
 ### Full experiment
 
