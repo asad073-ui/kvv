@@ -1,13 +1,14 @@
 # configs/experiment.yaml
 # ─────────────────────────────────────────────────────────────────────────────
 # TurboRAG KV-Cache Quantization Study – Full Experiment Configuration
+# Target hardware: Google Colab T4 (float16 only — NO bfloat16).
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 model:
-  name: "Qwen/Qwen2.5-3B-Instruct"   # FIX: was broken scratch path
+  name: "Qwen/Qwen2.5-3B-Instruct"
   use_flash_attn: false
-  dtype: "float16"                    # FIX: was bfloat16; T4 prefers float16
+  dtype: "float16"                    # T4 (sm_75) has no native bfloat16
 
 # ── Embedding model (retrieval) ────────────────────────────────────────────────
 embedding:
@@ -18,21 +19,22 @@ chunking:
   chunk_size:    512
   chunk_overlap: 10
 
-# ── Document collection (DPR Wikipedia passages, downloaded from Facebook CDN) ──
-# Passages are streamed from the public TSV on the first run and saved to
-# wiki_docs.save_dir/wiki_passages.jsonl.  Subsequent runs reload from that file.
-# Only the first num_docs rows are downloaded (~1 MB for 100 out of 21M passages).
+# ── Document collection ────────────────────────────────────────────────────────
+# DPR Wikipedia download is DISABLED for the Colab MVE (download_url: "").
+# Instead the retrieval corpus is built from the HotpotQA questions' own gold +
+# distractor paragraphs (see load_hotpotqa_corpus in chunk_cache.py), so that
+# retrieval recall > 0 and the model can actually answer the questions.
 wiki_docs:
-  download_url: "https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz"
-  num_docs:     100                   # FIX: was 10000; T4 has 15GB VRAM, keep small
+  download_url: ""                    # empty string disables the DPR TSV download
+  num_docs:     0
   save_dir:     "${SCRATCH_DIR}/wiki_dpr_docs"
 
 # ── Storage paths ──────────────────────────────────────────────────────────────
 paths:
   kvcache_dir:  "${SCRATCH_DIR}/chunk_kvcache"
   storage_dir:  "${SCRATCH_DIR}/doc_emb"
-  output_dir:   "${SCRATCH_DIR}/results"    # FIX: was relative; use SCRATCH_DIR
-  analysis_dir: "${SCRATCH_DIR}/analysis"   # FIX: was relative; use SCRATCH_DIR
+  output_dir:   "${SCRATCH_DIR}/results"
+  analysis_dir: "${SCRATCH_DIR}/analysis"
 
 # ── Retrieval ──────────────────────────────────────────────────────────────────
 retrieval:
@@ -55,10 +57,10 @@ datasets:
   nq_open:
     hf_name:        "nq_open"
     hf_config:      null
-    hf_split:       "train"           # FIX: was "validation"; nq_open has no validation split
+    hf_split:       "validation"      # nq_open DOES have a validation split
     question_field: "question"
     answer_field:   "answer"
-    num_examples:   50                # FIX: was 200; reduced for T4 memory safety
+    num_examples:   100
     description:    "Single-hop open-domain QA (tests H1 in controlled setting)"
 
   hotpotqa:
@@ -67,7 +69,8 @@ datasets:
     hf_split:       "validation"
     question_field: "question"
     answer_field:   "answer"
-    num_examples:   50                # FIX: was 200; reduced for T4 memory safety
+    num_examples:   100
+    use_provided_context: true        # build corpus from these questions' paragraphs
     description:    "Multi-hop QA (tests H1 and H2, main benchmark for H2)"
 
   rgb:
@@ -77,16 +80,15 @@ datasets:
     question_field: "question"
     answer_field:   "answer"
     query_file:     "questions/rgb.jsonl"
-    num_examples:   50                # FIX: was 200; reduced for T4 memory safety
+    num_examples:   100
     description:    "RAG robustness under noisy retrieval (tests H1, H3)"
-# [https://github.com/chen700564/RGB/blob/master/data/en_refine.json](https://github.com/chen700564/RGB/blob/master/data/en_refine.json)
 
 # ── Minimum Viable Experiment (override above for quick runs) ─────────────────
 mve:
-  enabled:      true                  # FIX: was false; Colab smoke-check needs MVE on
-  num_examples: 5                     # FIX: was 100; 5 examples for fast verification
-  datasets:     ["nq_open"]          # FIX: was ["nq_open","hotpotqa"]; single dataset for speed
-  k_values:     [1]                   # FIX: was [1,3,5]; k=1 only to reduce VRAM usage
+  enabled:      true                  # Colab smoke-check runs in MVE mode
+  num_examples: 100
+  datasets:     ["hotpotqa"]          # single dataset for the Colab MVE
+  k_values:     [1, 3, 5]
 
 # ── Generation ─────────────────────────────────────────────────────────────────
 generation:
@@ -95,9 +97,12 @@ generation:
   temperature:    null
 
 # ── Faithfulness evaluation ────────────────────────────────────────────────────
+# HHEM-2.1-Open (~250 MB, flan-t5-base based) and DeBERTa-NLI both fit on a T4.
+# With these OFF, hallucination_rate is "N/A" and the whole H1/H2/H3 machinery
+# (the point of the study) cannot run — so they are ON.
 evaluation:
-  eval_hhem: false                    # FIX: was true; HHEM model too heavy for T4
-  eval_nli:  false                    # FIX: was true; NLI model too heavy for T4
+  eval_hhem: true
+  eval_nli:  true
   hhem_model: "vectara/hallucination_evaluation_model"
   nli_model:  "cross-encoder/nli-deberta-v3-large"
   hallucination_threshold: 0.5
@@ -110,4 +115,4 @@ calibration:
 # ── GPU assignment ────────────────────────────────────────────────────────────
 gpu:
   chunk_cache_gpu: 0
-  evaluate_gpu:    0                  # FIX: was 1; Colab T4 has only 1 GPU (index 0)
+  evaluate_gpu:    0                  # Colab T4 has only one GPU (index 0)

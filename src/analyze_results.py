@@ -26,8 +26,11 @@ python src/analyze_results.py \
 """
 
 import os, sys, json, csv, argparse, math
+# proportions_ztest lives in statsmodels, NOT scipy.  Importing it from scipy
+# silently fails (scipy.stats has no such attribute) and disables every H3
+# significance test.  statsmodels is pinned in requirements.txt.
 try:
-    from scipy.stats import proportions_ztest
+    from statsmodels.stats.proportion import proportions_ztest
 except ImportError:
     proportions_ztest = None
 
@@ -104,7 +107,7 @@ def relative_drop(base_val: float, new_val: float) -> float:
 
 
 def write_csv(path, fieldnames, rows):
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
@@ -145,8 +148,12 @@ def main():
                 row_f1   = safe_float(row["F1"])
                 row_hall = safe_float(row["hallucination_rate"])
                 f1_drop   = relative_drop(base_f1,   row_f1)
-                faith_drop = relative_drop(1 - base_hall, 1 - row_hall)  # faithfulness drop
-                asymmetric = faith_drop > f1_drop
+                # Use the ABSOLUTE percentage-point change in hallucination rate.
+                # The old relative-faithfulness formula relative_drop(1-base_hall,
+                # 1-row_hall) blows up when base_hall ≈ 1.0 (denominator → 0).
+                faith_drop = (row_hall - base_hall) * 100   # +ve = more hallucination
+                # H1 holds when hallucination INCREASES and does so by more than F1 drops.
+                asymmetric = (faith_drop > 0) and (faith_drop > f1_drop)
                 h1_rows.append({
                     "dataset":          ds,
                     "k":                k,
@@ -156,19 +163,19 @@ def main():
                     "cond_f1":          round(row_f1, 4),
                     "cond_hall":        round(row_hall, 4),
                     "f1_drop_pct":      round(f1_drop, 2),
-                    "faith_drop_pct":   round(faith_drop, 2),
+                    "hall_delta_pp":    round(faith_drop, 2),
                     "h1_supported":     asymmetric,
                 })
                 report_lines.append(
                     f"  {ds:12s} K={k} {cond}: F1 drop={f1_drop:.1f}%  "
-                    f"Faith drop={faith_drop:.1f}%  "
+                    f"Hall Δpp={faith_drop:.1f}pp  "
                     f"H1={'SUPPORTED' if asymmetric else 'NOT supported'}"
                 )
 
     write_csv(
         os.path.join(args.output_dir, "h1_degradation.csv"),
         ["dataset","k","condition","fp16_f1","fp16_hall","cond_f1","cond_hall",
-         "f1_drop_pct","faith_drop_pct","h1_supported"],
+         "f1_drop_pct","hall_delta_pp","h1_supported"],
         h1_rows
     )
     report_lines.append("")
@@ -479,7 +486,7 @@ def main():
 
     # ── Write report ──
     report_path = os.path.join(args.output_dir, "report.txt")
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines))
     print("\n".join(report_lines))
     print(f"\nReport → {report_path}")

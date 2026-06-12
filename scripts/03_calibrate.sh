@@ -21,8 +21,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 # ── System paths ───────────────────────────────────────────────────────────────
-export SCRATCH_DIR="${SCRATCH_DIR:-/scratch/${USER}/turborag_quant}"
-export HF_HOME="${HF_HOME:-/scratch/${USER}/hf_cache}"
+# Colab: USER is unset and /scratch is not writable; default to /content.
+export SCRATCH_DIR="${SCRATCH_DIR:-/content/turborag_quant}"
+export HF_HOME="${HF_HOME:-/content/hf_cache}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 

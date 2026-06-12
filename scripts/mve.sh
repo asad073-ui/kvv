@@ -4,13 +4,12 @@
 # Minimum Viable Experiment — build + evaluate + analyze in one shot
 # ─────────────────────────────────────────────────────────────────────────────
 # Activates MVE mode from the mve: block in configs/experiment.yaml:
-#   mve.datasets     ["nq_open", "hotpotqa"]   (NQ-Open + HotpotQA from HF)
-#   mve.num_examples 100                        (examples per dataset)
+#   mve.datasets     ["hotpotqa"]   (HotpotQA from HF; corpus = its own paragraphs)
+#   mve.num_examples 100             (examples per dataset)
 #   mve.k_values     [1, 3, 5]
 #
-# Conditions evaluated: C1 (FP16), C2 (INT8), C3 (INT4)
-# — skip C0 Oracle to reduce runtime. To add it, set conditions: [C0, C1, C2, C3]
-# in the YAML before running.
+# Conditions evaluated: all four from the YAML conditions: list — C0 (Gold Oracle),
+# C1 (FP16), C2 (INT8), C3 (INT4). Edit conditions: in the YAML to change this.
 #
 # Sufficient to test H1 (asymmetric degradation) and H2 (chunk amplification).
 #
@@ -28,8 +27,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 # ── System paths ───────────────────────────────────────────────────────────────
-export SCRATCH_DIR="${SCRATCH_DIR:-/scratch/${USER}/turborag_quant}"
-export HF_HOME="${HF_HOME:-/scratch/${USER}/hf_cache}"
+# Colab: USER is unset and /scratch is not writable; default to /content.
+export SCRATCH_DIR="${SCRATCH_DIR:-/content/turborag_quant}"
+export HF_HOME="${HF_HOME:-/content/hf_cache}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 

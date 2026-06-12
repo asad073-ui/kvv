@@ -177,16 +177,31 @@ def config_to_chunk_cache_args(cfg: SimpleNamespace) -> list[str]:
         "--chunk_size",           str(cfg.chunking.chunk_size),
         "--chunk_overlap",        str(cfg.chunking.chunk_overlap),
     ]
-    if wd and getattr(wd, "download_url", None):
+
+    # Decide the corpus source.  When wiki_docs is disabled (no download_url or
+    # num_docs == 0), build the retrieval corpus from HotpotQA's own context
+    # paragraphs so retrieval recall > 0 and the model can answer the questions.
+    use_hq_corpus = (
+        wd is None
+        or not getattr(wd, "download_url", "")
+        or getattr(wd, "num_docs", 0) == 0
+    )
+
+    if use_hq_corpus:
+        # Number of HotpotQA questions to harvest paragraphs from.  Use the MVE
+        # example count when MVE is enabled, else 100.
+        mve = getattr(cfg, "mve", None)
+        if getattr(mve, "enabled", False):
+            n_ex = getattr(mve, "num_examples", 100)
+        else:
+            n_ex = 100
+        args += ["--hotpotqa_corpus", "--hotpotqa_num_examples", str(n_ex)]
+    else:
         args += [
             "--wiki_docs_url",      wd.download_url,
             "--wiki_docs_num",      str(getattr(wd, "num_docs", 10000)),
             "--wiki_docs_save_dir", wd.save_dir,
         ]
-    else:
-        # Fall back to local documents_dir if wiki_docs is not configured
-        docs_dir = getattr(getattr(cfg, "paths", None), "documents_dir", "documents")
-        args += ["--documents_dir", docs_dir]
     return args
 
 

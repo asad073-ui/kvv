@@ -177,8 +177,11 @@ def decompress_kvcache(compressed: list, precision: str) -> tuple:
     legacy = []
     for layer_data in compressed:
         if precision == "fp16":
-            k = layer_data["k"].to(torch.bfloat16)
-            v = layer_data["v"].to(torch.bfloat16)
+            # T4 path: keep everything float16.  (INT8/INT4 dequantize already
+            # restore the stored original dtype, which is float16 because the
+            # chunk caches are built with a float16 model.)
+            k = layer_data["k"].to(torch.float16)
+            v = layer_data["v"].to(torch.float16)
         elif precision == "int8":
             k = dequantize_int8(layer_data["k"])
             v = dequantize_int8(layer_data["v"])

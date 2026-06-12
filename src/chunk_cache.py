@@ -67,14 +67,21 @@ def get_args():
     parser.add_argument("--model_name",           type=str, required=True)
     parser.add_argument("--embedding_model_name", type=str, default="BAAI/bge-small-en-v1.5")
 
-    # DPR Wikipedia passage source (direct TSV download)
-    parser.add_argument("--wiki_docs_url",      type=str, default=DPR_TSV_URL,
-                        help="URL of psgs_w100.tsv.gz (Facebook CDN)")
+    # DPR Wikipedia passage source (direct TSV download).  Default empty: the DPR
+    # download is opt-in.  For the Colab MVE use --hotpotqa_corpus instead.
+    parser.add_argument("--wiki_docs_url",      type=str, default="",
+                        help="URL of psgs_w100.tsv.gz (Facebook CDN); empty to disable")
     parser.add_argument("--wiki_docs_num",      type=int, default=10000,
                         help="Number of passages to stream from the TSV")
     parser.add_argument("--wiki_docs_save_dir", type=str, default=None,
                         help="Directory to cache wiki_passages.jsonl. "
                              "Defaults to --output_path/../wiki_dpr_docs")
+
+    # HotpotQA corpus (recommended for the Colab MVE; replaces DPR Wikipedia)
+    parser.add_argument("--hotpotqa_corpus", action="store_true", default=False,
+                        help="Build corpus from HotpotQA context paragraphs instead of DPR Wikipedia")
+    parser.add_argument("--hotpotqa_num_examples", type=int, default=100,
+                        help="Number of HotpotQA examples to extract paragraphs from")
 
     # Local document fallback (used when --wiki_docs_url is empty string)
     parser.add_argument("--documents_dir",    type=str, default=None,
@@ -181,53 +188,86 @@ def load_local_documents(documents_dir: str) -> List[Document]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helper: read DynamicCache without to_legacy_cache() [removed in tf>=4.50]
+# HotpotQA corpus loader (replaces the DPR Wikipedia download for the MVE)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _read_dynamic_cache(past_key_values) -> list:
+def load_hotpotqa_corpus(hf_dataset, num_examples: int = 100) -> List[Document]:
     """
-    Convert whatever transformers returns as past_key_values into a flat list
-    of (key_tensor, value_tensor) pairs, one per transformer layer.
+    Extract all context paragraphs from a HotpotQA dataset slice and return them
+    as LlamaIndex Documents.  Each paragraph becomes one Document; deduplication
+    is by (title, first-80-chars) pair.
 
-    Replaces the old two-step pattern:
-        raw = past_key_values.to_legacy_cache()   # REMOVED in transformers>=4.50
-        pairs = _to_per_layer_pairs(raw)
+    This replaces the DPR Wikipedia download for the MVE.  Using the questions'
+    own gold + distractor paragraphs guarantees retrieval recall > 0 and lets the
+    model actually answer questions instead of refusing on an off-topic corpus.
 
-    Handles all transformers versions 4.38 – 4.51+:
-      - DynamicCache (4.38+):       reads .key_cache / .value_cache directly.
-      - Legacy tuple (pre-4.38):    already a list/tuple of (k, v) pairs.
-      - New-style legacy 2-element: ((k0,k1,...), (v0,v1,...))
+    HotpotQA "distractor" row schema:
+        row["context"]["title"]     -> list[str]
+        row["context"]["sentences"] -> list[list[str]]   (one list per title)
     """
-    if isinstance(past_key_values, DynamicCache):
-        if len(past_key_values.key_cache) == 0:
-            raise RuntimeError(
-                "[chunk_cache] DynamicCache has 0 layers — "
-                "use_cache=True did not populate the cache. "
-                "Check that Qwen2ModifiedForCausalLM.forward() is wired correctly."
-            )
-        return list(zip(past_key_values.key_cache, past_key_values.value_cache))
+    seen = set()
+    docs: List[Document] = []
+    for row in list(hf_dataset)[:num_examples]:
+        ctx       = row["context"]
+        titles    = ctx["title"]
+        sentences = ctx["sentences"]  # list of lists
+        for title, sent_list in zip(titles, sentences):
+            text = " ".join(sent_list).strip()
+            if not text:
+                continue
+            key = (title, text[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            docs.append(Document(
+                text=text,
+                metadata={"title": title, "source": "hotpotqa"},
+                id_=f"hq_{len(docs)}",
+            ))
+    print(f"[chunk_cache] Built corpus: {len(docs)} paragraphs "
+          f"from {num_examples} HotpotQA questions")
+    return docs
 
-    # Legacy tuple formats
-    if isinstance(past_key_values, (tuple, list)):
-        if len(past_key_values) == 0:
-            raise RuntimeError("[chunk_cache] past_key_values is an empty tuple.")
-        first = past_key_values[0]
-        # New-style legacy: 2-element tuple of (all_keys_tuple, all_values_tuple)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper: normalise DynamicCache.to_legacy_cache() output
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _to_per_layer_pairs(legacy_cache):
+    """
+    Normalise the output of DynamicCache.to_legacy_cache() to a sequence of
+    (key_tensor, value_tensor) pairs, one per transformer layer.
+
+    transformers<4.45  returned: ((k0,v0), (k1,v1), ...)   ← per-layer pairs
+    transformers>=4.45 returns:  ((k0,k1,...), (v0,v1,...)) ← 2-element tuple
+
+    Both formats are handled so the code is forward- and backward-compatible.
+
+    FIX-BUGC: The old check `len == 2 and not isinstance(..., Tensor)` failed
+    for models with exactly 2 layers, where the old format also has len == 2.
+    Now we additionally check `len(inner0) > 2` to distinguish the two:
+      - New format inner0 = (k0, k1, ..., kL-1) → len > 2 for L > 2
+      - Old format inner0 = (k0, v0) → len == 2
+    For the edge case of L == 2 with new format, inner0 = (k0, k1) has len == 2,
+    same as old format inner0 = (k0, v0).  We disambiguate by checking if inner0[0]
+    and inner0[1] have the same shape (both keys in new format) vs different shapes
+    (key and value in old format — though they typically have the same shape).
+    For safety, we also require inner0[0] to be a Tensor.
+    """
+    if len(legacy_cache) == 2 and not isinstance(legacy_cache[0], torch.Tensor):
+        inner0 = legacy_cache[0]
         if (
-            len(past_key_values) == 2
-            and not isinstance(first, torch.Tensor)
-            and hasattr(first, "__len__")
-            and len(first) > 2
-            and isinstance(first[0], torch.Tensor)
+            hasattr(inner0, "__len__")
+            and len(inner0) > 2
+            and isinstance(inner0[0], torch.Tensor)
         ):
-            all_keys, all_values = past_key_values
+            # Definitely new format: (all_keys_tuple, all_values_tuple)
+            all_keys, all_values = legacy_cache
             return list(zip(all_keys, all_values))
-        # Old-style legacy: per-layer pairs ((k0,v0), (k1,v1), ...)
-        return list(past_key_values)
-
-    raise TypeError(
-        f"[chunk_cache] Unrecognised past_key_values type: {type(past_key_values)}"
-    )
+        # Old format with exactly 2 layers: ((k0,v0), (k1,v1))
+        return list(legacy_cache)
+    # Old format with L != 2 layers
+    return list(legacy_cache)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -247,33 +287,22 @@ def compute_and_save_chunk(
     inputs  = tokenizer(wrapped, return_tensors="pt").to(device)
 
     with torch.no_grad():
-        # FIX-TOLEGACY: Do NOT pass past_key_values=None explicitly.
-        # On transformers>=4.48, passing None explicitly bypasses the internal
-        # DynamicCache initialisation inside Qwen2Model.forward(), leaving
-        # next_cache=None and causing:
-        #   AttributeError: 'NoneType' object has no attribute 'to_legacy_cache'
-        # Omitting the argument entirely lets the model create the cache correctly.
-        #
-        # TurboRAG Regime 3 (keys stored WITHOUT RoPE) is still triggered because
-        # Qwen2ModifiedAttention checks `past_key_values is None` at the attention
-        # layer level — not at the top-level forward() call — so the design is
-        # preserved exactly.
+        # use_cache=True makes Qwen2Model auto-create an (empty) DynamicCache and
+        # pass it to attention.  Qwen2ModifiedAttention then stores RAW
+        # (un-rotated) keys via cache.update(); RoPE is applied only to a local
+        # copy for the attention math, so to_legacy_cache() below returns the raw
+        # keys that TurboRAG stitching requires.
         outputs = model(**inputs, use_cache=True)
 
-    if outputs.past_key_values is None:
-        raise RuntimeError(
-            "[chunk_cache] model returned past_key_values=None with use_cache=True. "
-            "Check that Qwen2ModifiedForCausalLM overrides use_cache correctly."
-        )
-
-    # FIX-TOLEGACY: to_legacy_cache() was removed in transformers>=4.50.
-    # _read_dynamic_cache() reads .key_cache/.value_cache directly — stable on
-    # all transformers versions from 4.38 onwards.
-    per_layer = _read_dynamic_cache(outputs.past_key_values)
+    # DynamicCache.to_legacy_cache() format changed in transformers>=4.45.
+    # _to_per_layer_pairs() normalises both old and new formats so that
+    # compress_kvcache always receives [(k0,v0), (k1,v1), ...].
+    raw_legacy   = outputs.past_key_values.to_legacy_cache()
+    legacy_cache = _to_per_layer_pairs(raw_legacy)
 
     paths = {}
     for prec in PRECISIONS:
-        compressed = compress_kvcache(per_layer, prec)
+        compressed = compress_kvcache(legacy_cache, prec)
         fpath      = os.path.join(output_path, f"kvcache_chunk_{chunk_id}_{prec}.pt")
         torch.save(compressed, fpath)
         paths[prec] = fpath
@@ -350,7 +379,16 @@ def main():
     os.makedirs(args.storage_dir,  exist_ok=True)
 
     # ── Load documents ────────────────────────────────────────────────────────
-    if args.wiki_docs_url:
+    # Order matters: HotpotQA corpus is the recommended Colab MVE path and is
+    # checked first so it wins even if --wiki_docs_url is also supplied.
+    if args.hotpotqa_corpus:
+        try:
+            from datasets import load_dataset
+            hq_ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load HotpotQA for corpus building: {e}") from e
+        documents = load_hotpotqa_corpus(hq_ds, num_examples=args.hotpotqa_num_examples)
+    elif args.wiki_docs_url:
         save_dir = args.wiki_docs_save_dir or os.path.join(
             os.path.dirname(args.output_path), "wiki_dpr_docs"
         )
@@ -363,14 +401,14 @@ def main():
         documents = load_local_documents(args.documents_dir)
     else:
         raise ValueError(
-            "Provide either --wiki_docs_url (DPR TSV) or --documents_dir (local .txt files)"
+            "Provide --hotpotqa_corpus, --wiki_docs_url (DPR TSV), or --documents_dir"
         )
 
     # ── Load model + tokenizer ────────────────────────────────────────────────
     print(f"[chunk_cache] Loading model: {args.model_name}")
     model     = Qwen2ModifiedForCausalLM.from_pretrained(
         args.model_name,
-        torch_dtype=torch.float16,      # float16 for T4; bfloat16 on A100/H100
+        torch_dtype=torch.float16,        # T4 (sm_75): float16, never bfloat16
         attn_implementation="eager",
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)

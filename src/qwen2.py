@@ -1,14 +1,37 @@
 """
-qwen2.py  –  Modified Qwen2 attention for TurboRAG-style independent KV-cache stitching.
+qwen2.py — Modified Qwen2 attention for TurboRAG-style KV-cache stitching.
 
-Keys are stored WITHOUT RoPE applied so that, at query time, RoPE can be applied
-using the reordered global position IDs rather than the per-chunk local IDs.
-This matches the TurboRAG "reordered positions" design.
+Target: transformers==4.51.3 (pinned in requirements.txt).
+
+Design ("always store raw / always rotate full")
+────────────────────────────────────────────────
+Keys are stored WITHOUT RoPE in the DynamicCache.  On every forward step (chunk
+build, prefix build, and decode), RoPE is applied to the *full* retrieved key
+sequence using global position IDs [0, 1, ..., total_kv_len-1] on a LOCAL
+variable that is used for attention but is NEVER written back to the cache.  The
+cache therefore always holds raw keys.
+
+Why this makes independently-built chunk caches composable: if every chunk cache
+holds raw keys, then concatenating N chunk caches and rotating the stitched
+sequence with positions [0..total-1] gives exactly the same keys as if the whole
+concatenated document had been encoded in a single pass.  Queries are rotated with
+their own (global) positions supplied by the model via `position_embeddings`, so
+query↔key relative positions are always correct.
+
+This follows the TurboRAG "reordered positions" approach (Lu et al., EMNLP 2025).
+
+API notes for 4.51.3 (verified against the installed source):
+  * Qwen2DecoderLayer calls self_attn(..., past_key_value=<singular>, ...) and
+    unpacks a 2-tuple  ->  forward returns (attn_output, attn_weights).
+  * DynamicCache.update(key, value, layer_idx, cache_kwargs) stores the tensors
+    and returns the concatenated (all_keys, all_values).
+  * Qwen2Attention.__init__ on 4.51.3 does NOT set num_heads / num_key_value_heads
+    / hidden_size, so we set them here.
 """
 
 from typing import Optional, Tuple
+
 import torch
-import math
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
@@ -23,43 +46,49 @@ from transformers.models.qwen2.modeling_qwen2 import (
 from transformers.cache_utils import Cache
 
 
-def apply_single_rotary_pos_emb(inputs, cos, sin, unsqueeze_dim=1):
-    """Apply RoPE to a single tensor.
-    cos/sin shape: [batch, seq_len, head_dim] – already index-selected for the
-    relevant position_ids.
+def apply_single_rotary_pos_emb(
+    t: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> torch.Tensor:
+    """Apply RoPE to a single tensor (query or key).
+
+    cos/sin shape: [batch, seq_len, head_dim] — already index-selected for the
+    relevant position ids.  unsqueeze_dim=1 inserts the head axis.
     """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    return (inputs * cos) + (rotate_half(inputs) * sin)
+    return (t * cos) + (rotate_half(t) * sin)
 
 
 class Qwen2ModifiedAttention(Qwen2Attention):
     """
-    Drop-in replacement for Qwen2Attention that stores raw (un-rotated) keys in
-    the KV cache and applies RoPE at attention time using the *global* position IDs.
-    This is required for TurboRAG's cache-stitching to work correctly across chunks.
+    Drop-in replacement for Qwen2Attention (transformers==4.51.3) that stores raw
+    (un-rotated) keys in the DynamicCache and applies RoPE to the full key
+    sequence with global position ids at every forward step.
     """
 
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__(config, layer_idx)
+        # 4.51.3's Qwen2Attention.__init__ does not set these; we need them.
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.hidden_size = config.hidden_size
-        # Keep a local rotary_emb for re-applying RoPE to the full key sequence
-        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
+        # Separate RotaryEmbedding instance for re-applying RoPE to the full key
+        # sequence.  Config-driven, so it matches the model's rope settings.
+        self.rotary_emb_full = Qwen2RotaryEmbedding(config=config)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+        past_key_value: Optional[Cache] = None,   # singular — matches 4.51.3
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+        **kwargs,                                  # absorbs position_ids/use_cache
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # 2-tuple — matches 4.51.3
+        output_attentions = bool(kwargs.get("output_attentions", False))
 
         bsz, q_len, _ = hidden_states.size()
 
@@ -73,127 +102,59 @@ class Qwen2ModifiedAttention(Qwen2Attention):
 
         cos, sin = position_embeddings
 
-        # ── Apply RoPE only to queries using the shared position_embeddings ──
+        # ── Queries: RoPE with the model-supplied (global) position embeddings ──
         query_states = apply_single_rotary_pos_emb(query_states, cos, sin)
 
-        # ── Determine RoPE regime based on cache state ──
-        # FIX-BUGB: Three regimes for key RoPE application:
-        #
-        #   Regime 1 — First decode step after stitching:
-        #     _rope_applied_to_prefix == False.  ALL keys in the cache are un-rotated
-        #     (TurboRAG design).  Apply RoPE to the FULL key sequence (cached + new)
-        #     using global position IDs, then mark the flag as True.
-        #
-        #   Regime 2 — Incremental decode steps:
-        #     _rope_applied_to_prefix == True (or flag absent = standard model use).
-        #     Cached keys already have RoPE.  Apply RoPE to NEW keys only BEFORE
-        #     storing them in the cache.
-        #
-        #   Regime 3 — No cache (chunk build phase):
-        #     past_key_values is None.  Do NOT apply RoPE to keys — they are stored
-        #     un-rotated by design for TurboRAG cache stitching.
-
-        rope_applied = getattr(past_key_values, "_rope_applied_to_prefix", True) if past_key_values is not None else True
-
-        if past_key_values is not None and not rope_applied:
-            # ── Regime 1: first decode after stitching ──
-            # Store un-rotated new keys in cache first
+        # ── Keys/values: store RAW, then rotate the FULL sequence locally ──────
+        # cache.update() stores raw key_states and returns ALL cached keys
+        # (previous + current), still un-rotated.  We rotate that whole sequence
+        # with global ids [0..total-1] into a LOCAL variable only.
+        if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-            # key_states is now [all_cached_unrotated | new_unrotated]
-
-            # Apply RoPE to the FULL key sequence using global position IDs
-            total_kv_len = key_states.shape[-2]
-            full_position_ids = torch.arange(
-                0, total_kv_len,
-                dtype=torch.long, device=query_states.device
-            ).unsqueeze(0)
-            cos_keys, sin_keys = self.rotary_emb(hidden_states, full_position_ids)
-            key_states = apply_single_rotary_pos_emb(key_states, cos_keys, sin_keys)
-
-            # FIX-BUGF: Write rotated keys BACK into the cache.
-            # Without this, subsequent Regime-2 decode steps read un-rotated
-            # keys from the cache, producing garbage attention after token 1.
-            past_key_values.key_cache[self.layer_idx] = key_states
-
-            # Mark flag after ALL layers have processed on this step.
-            # We set it on every layer's pass; after the forward completes for all
-            # layers, the flag is True and subsequent steps use Regime 2.
-            past_key_values._rope_applied_to_prefix = True
-
-            kv_seq_len = total_kv_len
-
-        elif past_key_values is not None:
-            # ── Regime 2: incremental decode (cached keys already have RoPE) ──
-            cached_len = past_key_values.get_seq_length(self.layer_idx)
-
-            # Apply RoPE to new keys using their global positions BEFORE storing
-            new_pos_ids = torch.arange(
-                cached_len, cached_len + q_len,
-                dtype=torch.long, device=key_states.device
-            ).unsqueeze(0)
-            cos_new, sin_new = self.rotary_emb(hidden_states, new_pos_ids)
-            key_states = apply_single_rotary_pos_emb(key_states, cos_new, sin_new)
-
-            # Store RoPE-applied keys in cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
+            key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-            kv_seq_len = key_states.shape[-2]
+        total_kv_len = key_states.shape[-2]
+        full_position_ids = torch.arange(
+            0, total_kv_len, dtype=torch.long, device=hidden_states.device
+        ).unsqueeze(0)
+        cos_k, sin_k = self.rotary_emb_full(hidden_states, full_position_ids)
+        key_states = apply_single_rotary_pos_emb(key_states, cos_k, sin_k)
 
-        else:
-            # ── Regime 3: chunk build phase — NO RoPE on keys ──
-            # Keys are stored un-rotated by DynamicCache (TurboRAG design).
-            # chunk_cache.py extracts them via to_legacy_cache() after the forward.
-            kv_seq_len = key_states.shape[-2]
+        # ── GQA expansion ──────────────────────────────────────────────────────
+        key_states_exp   = repeat_kv(key_states,   self.num_key_value_groups)
+        value_states_exp = repeat_kv(value_states, self.num_key_value_groups)
 
-        key_states   = repeat_kv(key_states,   self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, "
-                f"but is {attn_weights.size()}"
-            )
+        # ── Eager scaled dot-product attention ────────────────────────────────
+        attn_weights = torch.matmul(query_states, key_states_exp.transpose(2, 3)) * self.scaling
 
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+            causal_mask = attention_mask[:, :, :, : key_states_exp.shape[-2]]
+            attn_weights = attn_weights + causal_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output  = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, "
-                f"but is {attn_output.size()}"
-            )
+        attn_output  = torch.matmul(attn_weights, value_states_exp)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
-
-        # ── FIX: return past_key_values as 3rd element ──
-        # Qwen2DecoderLayer.forward unpacks all 3 values from the attention return.
-        return attn_output, attn_weights, past_key_values
+        return attn_output, (attn_weights if output_attentions else None)
 
 
 class Qwen2ModifiedDecoderLayer(Qwen2DecoderLayer):
+    """Replaces only self_attn with the modified attention; forward is inherited."""
+
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__(config, layer_idx)
         self.self_attn = Qwen2ModifiedAttention(config, layer_idx)
 
 
 class Qwen2ModifiedModel(Qwen2Model):
+    """Replaces decoder layers with modified versions; everything else inherited."""
+
     def __init__(self, config: Qwen2Config):
         super().__init__(config)
         self.layers = nn.ModuleList(
@@ -203,6 +164,8 @@ class Qwen2ModifiedModel(Qwen2Model):
 
 
 class Qwen2ModifiedForCausalLM(Qwen2ForCausalLM):
+    """Entry point used by chunk_cache.py and evaluate.py."""
+
     def __init__(self, config: Qwen2Config):
         super().__init__(config)
         self.model = Qwen2ModifiedModel(config)

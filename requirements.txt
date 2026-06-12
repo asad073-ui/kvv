@@ -1,0 +1,33 @@
+# requirements.txt -- TurboRAG KV-Cache Quantization Study
+#
+# Target hardware: Google Colab T4 (sm_75, float16 only -- NO bfloat16).
+# transformers is PINNED to 4.51.3: the modified Qwen2 attention in src/qwen2.py
+# is written against that exact API (singular past_key_value kwarg, 2-tuple
+# attention return, DynamicCache.to_legacy_cache / from_legacy_cache).
+
+# -- Core ML --------------------------------------------------------------------
+torch>=2.1.0
+transformers==4.51.3
+accelerate>=0.28.0
+
+# -- RAG / Retrieval ------------------------------------------------------------
+llama-index-core>=0.10.0
+llama-index-embeddings-huggingface>=0.2.0
+sentence-transformers>=2.6.0
+faiss-cpu>=1.7.4
+
+# -- Datasets / Faithfulness evaluation -----------------------------------------
+# HHEM-2.1-Open and DeBERTa-NLI are loaded via HuggingFace; no extra pip install.
+datasets>=2.18.0
+
+# -- Statistics -----------------------------------------------------------------
+# proportions_ztest lives in statsmodels, NOT scipy. statsmodels is required for
+# the H3 significance test in analyze_results.py.
+statsmodels>=0.14.0
+scipy>=1.11.0
+numpy>=1.24.0
+
+# -- Utilities ------------------------------------------------------------------
+tabulate>=0.9.0
+tqdm>=4.66.0
+pyyaml>=6.0

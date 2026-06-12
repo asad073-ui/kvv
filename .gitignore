@@ -1,4 +1,6 @@
 *.pyc
 *.txt
+# requirements.txt must stay tracked (it was being swallowed by *.txt -> K9)
+!requirements.txt
 /documents
 /__pycache__
