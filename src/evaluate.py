@@ -58,6 +58,21 @@ FIX LOG
                   IndexError: index -1 is out of bounds for dimension 0 with size 0
                 in prepare_inputs_for_generation (utils.py line 388).
                 Fix: cache_position=torch.arange(cached_len, cached_len + new_len).
+
+  FIX-BUGA      prefix_kvcache was a raw tuple when model() returns legacy format
+                (transformers<4.38 or direct model() call without DynamicCache).
+                hasattr guard checked but never converted → tuple flowed to
+                stack_past_key_values() → crash at first.key_cache.
+                Fix: pass empty DynamicCache() to forward; defensive isinstance check.
+
+  FIX-BUGB      Stitched cache keys are un-rotated (TurboRAG design). During generate(),
+                incremental decode steps were re-applying RoPE to ALL cached keys on
+                every step → double/triple/N-tuple RoPE on previously decoded tokens.
+                Fix: _rope_applied_to_prefix flag on stitched cache; qwen2.py checks it.
+
+  FIX-BUGD      generate_with_cache did not validate that the stitched cache layer count
+                matches model.config.num_hidden_layers. Mismatch causes silent wrong
+                answers. Fix: validate and fall back to C0 if mismatched.
 """
 
 
@@ -346,6 +361,20 @@ def generate_with_cache(
     """Generate an answer given either a stitched KV cache (C1-C3) or raw chunks (C0)."""
     with torch.no_grad():
         if past_kvcache is not None:
+            # FIX-BUGD: validate that cache layers match model layers
+            n_model_layers = model.config.num_hidden_layers
+            n_cache_layers = len(past_kvcache.key_cache)
+            if n_cache_layers != n_model_layers:
+                log.error(
+                    "Cache layer mismatch: cache has %d layers, model has %d. "
+                    "Falling back to C0-style generation.",
+                    n_cache_layers, n_model_layers,
+                )
+                return generate_with_cache(
+                    model, tokenizer, device, None, query, chunks
+                )
+
+
             suffix        = build_query_suffix(query)
             new_input_ids = tokenizer.encode(suffix, return_tensors="pt").to(device)
             cached_len    = _get_cache_seq_len(past_kvcache)
@@ -502,6 +531,9 @@ def run_query(
             kv_size_bytes += cache_size_bytes(compressed, precision)
 
         stitched = stack_past_key_values(kvcache_list)
+        # FIX-BUGB: signal to qwen2.py that prefix keys are UN-rotated and
+        # need RoPE applied on the first decode step.
+        stitched._rope_applied_to_prefix = False
         answer   = generate_with_cache(model, tokenizer, device, stitched, query, [])
 
     ttft = time.perf_counter() - t0
@@ -657,14 +689,36 @@ def main():
     log.info("Pre-computing system prefix KV cache ...")
     prefix_inputs = tokenizer([SYSTEM_PROMPT], return_tensors="pt", padding=True)
     with torch.no_grad():
+        # FIX-BUGA: pass an empty DynamicCache to force the model to return a
+        # DynamicCache regardless of transformers version.  Without this, many
+        # versions return a raw tuple ((k0,v0), ...) which crashes downstream.
+        empty_cache = DynamicCache()
         prefix_out = model(
             prefix_inputs["input_ids"].to(device),
             attention_mask=prefix_inputs["attention_mask"].to(device),
+            past_key_values=empty_cache,
             use_cache=True,
         )
     prefix_kvcache = prefix_out.past_key_values
-    if hasattr(prefix_kvcache, "key_cache") and len(prefix_kvcache.key_cache) > 0:
+
+    # FIX-BUGA (defensive): if model ignored the passed cache and returned tuple
+    if not isinstance(prefix_kvcache, DynamicCache):
+        log.warning(
+            "prefix_kvcache is %s, not DynamicCache — converting. "
+            "Check transformers version.",
+            type(prefix_kvcache).__name__,
+        )
+        per_layer = _normalise_legacy(prefix_kvcache)
+        prefix_kvcache = _build_dynamic_cache(per_layer)
+
+    # Always patch _seen_tokens from actual tensor shape (FIX-SEEN)
+    if len(prefix_kvcache.key_cache) > 0:
         prefix_kvcache._seen_tokens = prefix_kvcache.key_cache[0].shape[2]
+    log.info(
+        "Prefix KV cache ready: %d layers, seq_len=%d",
+        len(prefix_kvcache.key_cache),
+        prefix_kvcache._seen_tokens,
+    )
 
     log.info("Loading retrieval index ...")
     Settings.embed_model = HuggingFaceEmbedding(model_name=args.embedding_model_name)

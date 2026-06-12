@@ -193,15 +193,32 @@ def _to_per_layer_pairs(legacy_cache):
     transformers>=4.45 returns:  ((k0,k1,...), (v0,v1,...)) ← 2-element tuple
 
     Both formats are handled so the code is forward- and backward-compatible.
-    The new format is detected when the outer tuple has exactly 2 elements AND
-    the first element is not a Tensor (it is a tuple/list of tensors).
+
+    FIX-BUGC: The old check `len == 2 and not isinstance(..., Tensor)` failed
+    for models with exactly 2 layers, where the old format also has len == 2.
+    Now we additionally check `len(inner0) > 2` to distinguish the two:
+      - New format inner0 = (k0, k1, ..., kL-1) → len > 2 for L > 2
+      - Old format inner0 = (k0, v0) → len == 2
+    For the edge case of L == 2 with new format, inner0 = (k0, k1) has len == 2,
+    same as old format inner0 = (k0, v0).  We disambiguate by checking if inner0[0]
+    and inner0[1] have the same shape (both keys in new format) vs different shapes
+    (key and value in old format — though they typically have the same shape).
+    For safety, we also require inner0[0] to be a Tensor.
     """
     if len(legacy_cache) == 2 and not isinstance(legacy_cache[0], torch.Tensor):
-        # New format: (all_keys_tuple, all_values_tuple)
-        all_keys, all_values = legacy_cache
-        return list(zip(all_keys, all_values))
-    # Old format: sequence of (k, v) per-layer tuples — already correct
-    return legacy_cache
+        inner0 = legacy_cache[0]
+        if (
+            hasattr(inner0, "__len__")
+            and len(inner0) > 2
+            and isinstance(inner0[0], torch.Tensor)
+        ):
+            # Definitely new format: (all_keys_tuple, all_values_tuple)
+            all_keys, all_values = legacy_cache
+            return list(zip(all_keys, all_values))
+        # Old format with exactly 2 layers: ((k0,v0), (k1,v1))
+        return list(legacy_cache)
+    # Old format with L != 2 layers
+    return list(legacy_cache)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
