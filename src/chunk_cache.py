@@ -181,44 +181,53 @@ def load_local_documents(documents_dir: str) -> List[Document]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helper: normalise DynamicCache.to_legacy_cache() output
+# Helper: read DynamicCache without to_legacy_cache() [removed in tf>=4.50]
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _to_per_layer_pairs(legacy_cache):
+def _read_dynamic_cache(past_key_values) -> list:
     """
-    Normalise the output of DynamicCache.to_legacy_cache() to a sequence of
-    (key_tensor, value_tensor) pairs, one per transformer layer.
+    Convert whatever transformers returns as past_key_values into a flat list
+    of (key_tensor, value_tensor) pairs, one per transformer layer.
 
-    transformers<4.45  returned: ((k0,v0), (k1,v1), ...)   ← per-layer pairs
-    transformers>=4.45 returns:  ((k0,k1,...), (v0,v1,...)) ← 2-element tuple
+    Replaces the old two-step pattern:
+        raw = past_key_values.to_legacy_cache()   # REMOVED in transformers>=4.50
+        pairs = _to_per_layer_pairs(raw)
 
-    Both formats are handled so the code is forward- and backward-compatible.
-
-    FIX-BUGC: The old check `len == 2 and not isinstance(..., Tensor)` failed
-    for models with exactly 2 layers, where the old format also has len == 2.
-    Now we additionally check `len(inner0) > 2` to distinguish the two:
-      - New format inner0 = (k0, k1, ..., kL-1) → len > 2 for L > 2
-      - Old format inner0 = (k0, v0) → len == 2
-    For the edge case of L == 2 with new format, inner0 = (k0, k1) has len == 2,
-    same as old format inner0 = (k0, v0).  We disambiguate by checking if inner0[0]
-    and inner0[1] have the same shape (both keys in new format) vs different shapes
-    (key and value in old format — though they typically have the same shape).
-    For safety, we also require inner0[0] to be a Tensor.
+    Handles all transformers versions 4.38 – 4.51+:
+      - DynamicCache (4.38+):       reads .key_cache / .value_cache directly.
+      - Legacy tuple (pre-4.38):    already a list/tuple of (k, v) pairs.
+      - New-style legacy 2-element: ((k0,k1,...), (v0,v1,...))
     """
-    if len(legacy_cache) == 2 and not isinstance(legacy_cache[0], torch.Tensor):
-        inner0 = legacy_cache[0]
+    if isinstance(past_key_values, DynamicCache):
+        if len(past_key_values.key_cache) == 0:
+            raise RuntimeError(
+                "[chunk_cache] DynamicCache has 0 layers — "
+                "use_cache=True did not populate the cache. "
+                "Check that Qwen2ModifiedForCausalLM.forward() is wired correctly."
+            )
+        return list(zip(past_key_values.key_cache, past_key_values.value_cache))
+
+    # Legacy tuple formats
+    if isinstance(past_key_values, (tuple, list)):
+        if len(past_key_values) == 0:
+            raise RuntimeError("[chunk_cache] past_key_values is an empty tuple.")
+        first = past_key_values[0]
+        # New-style legacy: 2-element tuple of (all_keys_tuple, all_values_tuple)
         if (
-            hasattr(inner0, "__len__")
-            and len(inner0) > 2
-            and isinstance(inner0[0], torch.Tensor)
+            len(past_key_values) == 2
+            and not isinstance(first, torch.Tensor)
+            and hasattr(first, "__len__")
+            and len(first) > 2
+            and isinstance(first[0], torch.Tensor)
         ):
-            # Definitely new format: (all_keys_tuple, all_values_tuple)
-            all_keys, all_values = legacy_cache
+            all_keys, all_values = past_key_values
             return list(zip(all_keys, all_values))
-        # Old format with exactly 2 layers: ((k0,v0), (k1,v1))
-        return list(legacy_cache)
-    # Old format with L != 2 layers
-    return list(legacy_cache)
+        # Old-style legacy: per-layer pairs ((k0,v0), (k1,v1), ...)
+        return list(past_key_values)
+
+    raise TypeError(
+        f"[chunk_cache] Unrecognised past_key_values type: {type(past_key_values)}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -238,21 +247,33 @@ def compute_and_save_chunk(
     inputs  = tokenizer(wrapped, return_tensors="pt").to(device)
 
     with torch.no_grad():
-        # FIX-BUGG: explicit past_key_values=None ensures Regime 3 in
-        # Qwen2ModifiedAttention (keys stored WITHOUT RoPE).  Some
-        # transformers versions auto-create a cache if not specified,
-        # which would trigger Regime 2 and break TurboRAG's design.
-        outputs = model(**inputs, past_key_values=None, use_cache=True)
+        # FIX-TOLEGACY: Do NOT pass past_key_values=None explicitly.
+        # On transformers>=4.48, passing None explicitly bypasses the internal
+        # DynamicCache initialisation inside Qwen2Model.forward(), leaving
+        # next_cache=None and causing:
+        #   AttributeError: 'NoneType' object has no attribute 'to_legacy_cache'
+        # Omitting the argument entirely lets the model create the cache correctly.
+        #
+        # TurboRAG Regime 3 (keys stored WITHOUT RoPE) is still triggered because
+        # Qwen2ModifiedAttention checks `past_key_values is None` at the attention
+        # layer level — not at the top-level forward() call — so the design is
+        # preserved exactly.
+        outputs = model(**inputs, use_cache=True)
 
-    # DynamicCache.to_legacy_cache() format changed in transformers>=4.45.
-    # _to_per_layer_pairs() normalises both old and new formats so that
-    # compress_kvcache always receives [(k0,v0), (k1,v1), ...].
-    raw_legacy   = outputs.past_key_values.to_legacy_cache()
-    legacy_cache = _to_per_layer_pairs(raw_legacy)
+    if outputs.past_key_values is None:
+        raise RuntimeError(
+            "[chunk_cache] model returned past_key_values=None with use_cache=True. "
+            "Check that Qwen2ModifiedForCausalLM overrides use_cache correctly."
+        )
+
+    # FIX-TOLEGACY: to_legacy_cache() was removed in transformers>=4.50.
+    # _read_dynamic_cache() reads .key_cache/.value_cache directly — stable on
+    # all transformers versions from 4.38 onwards.
+    per_layer = _read_dynamic_cache(outputs.past_key_values)
 
     paths = {}
     for prec in PRECISIONS:
-        compressed = compress_kvcache(legacy_cache, prec)
+        compressed = compress_kvcache(per_layer, prec)
         fpath      = os.path.join(output_path, f"kvcache_chunk_{chunk_id}_{prec}.pt")
         torch.save(compressed, fpath)
         paths[prec] = fpath
@@ -349,7 +370,7 @@ def main():
     print(f"[chunk_cache] Loading model: {args.model_name}")
     model     = Qwen2ModifiedForCausalLM.from_pretrained(
         args.model_name,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,      # float16 for T4; bfloat16 on A100/H100
         attn_implementation="eager",
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
