@@ -113,6 +113,11 @@ class Qwen2ModifiedAttention(Qwen2Attention):
             cos_keys, sin_keys = self.rotary_emb(hidden_states, full_position_ids)
             key_states = apply_single_rotary_pos_emb(key_states, cos_keys, sin_keys)
 
+            # FIX-BUGF: Write rotated keys BACK into the cache.
+            # Without this, subsequent Regime-2 decode steps read un-rotated
+            # keys from the cache, producing garbage attention after token 1.
+            past_key_values.key_cache[self.layer_idx] = key_states
+
             # Mark flag after ALL layers have processed on this step.
             # We set it on every layer's pass; after the forward completes for all
             # layers, the flag is True and subsequent steps use Regime 2.

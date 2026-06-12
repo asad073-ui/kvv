@@ -73,6 +73,21 @@ FIX LOG
   FIX-BUGD      generate_with_cache did not validate that the stitched cache layer count
                 matches model.config.num_hidden_layers. Mismatch causes silent wrong
                 answers. Fix: validate and fall back to C0 if mismatched.
+
+  FIX-BUGE      prefix_kvcache was computed with past_key_values=DynamicCache() which
+                triggered Regime 2 → keys stored WITH RoPE.  Chunk caches use Regime 3
+                → keys stored WITHOUT RoPE.  Stitching them and re-applying RoPE in
+                Regime 1 caused double-RoPE on prefix keys → garbage attention.
+                Fix: pass past_key_values=None for prefix computation (Regime 3).
+
+  FIX-BUGF      Regime 1 in qwen2.py applied RoPE to the full key sequence but only
+                updated the local variable — the cache still held un-rotated keys.
+                Subsequent Regime-2 decode steps read wrong keys → garbage after token 1.
+                Fix: write rotated keys back with past_key_values.key_cache[layer] = key_states.
+
+  FIX-BUGG      chunk_cache.py compute_and_save_chunk did not explicitly pass
+                past_key_values=None, making it fragile if transformers auto-creates a
+                cache.  Fix: add explicit past_key_values=None.
 """
 
 
@@ -689,19 +704,24 @@ def main():
     log.info("Pre-computing system prefix KV cache ...")
     prefix_inputs = tokenizer([SYSTEM_PROMPT], return_tensors="pt", padding=True)
     with torch.no_grad():
-        # FIX-BUGA: pass an empty DynamicCache to force the model to return a
-        # DynamicCache regardless of transformers version.  Without this, many
-        # versions return a raw tuple ((k0,v0), ...) which crashes downstream.
-        empty_cache = DynamicCache()
+        # FIX-BUGE: pass past_key_values=None so Qwen2ModifiedAttention enters
+        # Regime 3 (keys stored WITHOUT RoPE).  This matches the TurboRAG chunk
+        # cache design — all cached keys are un-rotated; RoPE is applied once at
+        # decode time via Regime 1.
+        #
+        # Previously FIX-BUGA passed DynamicCache() which triggered Regime 2
+        # (RoPE applied to keys before storing).  Stitching those rotated prefix
+        # keys with un-rotated chunk keys, then re-applying RoPE in Regime 1,
+        # caused double-RoPE on the prefix → garbage attention.
         prefix_out = model(
             prefix_inputs["input_ids"].to(device),
             attention_mask=prefix_inputs["attention_mask"].to(device),
-            past_key_values=empty_cache,
+            past_key_values=None,     # Regime 3: un-rotated keys
             use_cache=True,
         )
     prefix_kvcache = prefix_out.past_key_values
 
-    # FIX-BUGA (defensive): if model ignored the passed cache and returned tuple
+    # Convert to DynamicCache if model returned a tuple (FIX-BUGA defensive)
     if not isinstance(prefix_kvcache, DynamicCache):
         log.warning(
             "prefix_kvcache is %s, not DynamicCache — converting. "

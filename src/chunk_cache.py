@@ -238,7 +238,11 @@ def compute_and_save_chunk(
     inputs  = tokenizer(wrapped, return_tensors="pt").to(device)
 
     with torch.no_grad():
-        outputs = model(**inputs, use_cache=True)
+        # FIX-BUGG: explicit past_key_values=None ensures Regime 3 in
+        # Qwen2ModifiedAttention (keys stored WITHOUT RoPE).  Some
+        # transformers versions auto-create a cache if not specified,
+        # which would trigger Regime 2 and break TurboRAG's design.
+        outputs = model(**inputs, past_key_values=None, use_cache=True)
 
     # DynamicCache.to_legacy_cache() format changed in transformers>=4.45.
     # _to_per_layer_pairs() normalises both old and new formats so that
