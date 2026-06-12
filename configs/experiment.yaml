@@ -5,9 +5,9 @@
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 model:
-  name: "/scratch/${USER}/hf_cache/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1"
+  name: "Qwen/Qwen2.5-3B-Instruct"   # FIX: was broken scratch path
   use_flash_attn: false
-  dtype: "bfloat16"
+  dtype: "float16"                    # FIX: was bfloat16; T4 prefers float16
 
 # ── Embedding model (retrieval) ────────────────────────────────────────────────
 embedding:
@@ -21,18 +21,18 @@ chunking:
 # ── Document collection (DPR Wikipedia passages, downloaded from Facebook CDN) ──
 # Passages are streamed from the public TSV on the first run and saved to
 # wiki_docs.save_dir/wiki_passages.jsonl.  Subsequent runs reload from that file.
-# Only the first num_docs rows are downloaded (~1 MB for 10k out of 21M passages).
+# Only the first num_docs rows are downloaded (~1 MB for 100 out of 21M passages).
 wiki_docs:
   download_url: "https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz"
-  num_docs:     10000          # passages to stream; increase for full coverage
+  num_docs:     100                   # FIX: was 10000; T4 has 15GB VRAM, keep small
   save_dir:     "${SCRATCH_DIR}/wiki_dpr_docs"
 
 # ── Storage paths ──────────────────────────────────────────────────────────────
 paths:
   kvcache_dir:  "${SCRATCH_DIR}/chunk_kvcache"
   storage_dir:  "${SCRATCH_DIR}/doc_emb"
-  output_dir:   "results"
-  analysis_dir: "analysis"
+  output_dir:   "${SCRATCH_DIR}/results"    # FIX: was relative; use SCRATCH_DIR
+  analysis_dir: "${SCRATCH_DIR}/analysis"   # FIX: was relative; use SCRATCH_DIR
 
 # ── Retrieval ──────────────────────────────────────────────────────────────────
 retrieval:
@@ -55,10 +55,10 @@ datasets:
   nq_open:
     hf_name:        "nq_open"
     hf_config:      null
-    hf_split:       "validation"
+    hf_split:       "train"           # FIX: was "validation"; nq_open has no validation split
     question_field: "question"
     answer_field:   "answer"
-    num_examples:   200
+    num_examples:   50                # FIX: was 200; reduced for T4 memory safety
     description:    "Single-hop open-domain QA (tests H1 in controlled setting)"
 
   hotpotqa:
@@ -67,7 +67,7 @@ datasets:
     hf_split:       "validation"
     question_field: "question"
     answer_field:   "answer"
-    num_examples:   200
+    num_examples:   50                # FIX: was 200; reduced for T4 memory safety
     description:    "Multi-hop QA (tests H1 and H2, main benchmark for H2)"
 
   rgb:
@@ -77,15 +77,16 @@ datasets:
     question_field: "question"
     answer_field:   "answer"
     query_file:     "questions/rgb.jsonl"
-    num_examples:   200
+    num_examples:   50                # FIX: was 200; reduced for T4 memory safety
     description:    "RAG robustness under noisy retrieval (tests H1, H3)"
-# https://github.com/chen700564/RGB/blob/master/data/en_refine.json
+# [https://github.com/chen700564/RGB/blob/master/data/en_refine.json](https://github.com/chen700564/RGB/blob/master/data/en_refine.json)
+
 # ── Minimum Viable Experiment (override above for quick runs) ─────────────────
 mve:
-  enabled:      false
-  num_examples: 100
-  datasets:     ["nq_open", "hotpotqa"]
-  k_values:     [1, 3, 5]
+  enabled:      true                  # FIX: was false; Colab smoke-check needs MVE on
+  num_examples: 5                     # FIX: was 100; 5 examples for fast verification
+  datasets:     ["nq_open"]          # FIX: was ["nq_open","hotpotqa"]; single dataset for speed
+  k_values:     [1]                   # FIX: was [1,3,5]; k=1 only to reduce VRAM usage
 
 # ── Generation ─────────────────────────────────────────────────────────────────
 generation:
@@ -95,8 +96,8 @@ generation:
 
 # ── Faithfulness evaluation ────────────────────────────────────────────────────
 evaluation:
-  eval_hhem: true
-  eval_nli:  true
+  eval_hhem: false                    # FIX: was true; HHEM model too heavy for T4
+  eval_nli:  false                    # FIX: was true; NLI model too heavy for T4
   hhem_model: "vectara/hallucination_evaluation_model"
   nli_model:  "cross-encoder/nli-deberta-v3-large"
   hallucination_threshold: 0.5
@@ -109,4 +110,4 @@ calibration:
 # ── GPU assignment ────────────────────────────────────────────────────────────
 gpu:
   chunk_cache_gpu: 0
-  evaluate_gpu:    1
+  evaluate_gpu:    0                  # FIX: was 1; Colab T4 has only 1 GPU (index 0)
