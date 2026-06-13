@@ -94,7 +94,7 @@ SYSTEM_PROMPT = (
 )
 
 
-QUERY_SUFFIX_TEMPLATE = "\n\nQuestion: {query}<|im_end|><|im_start|>assistant\n"
+QUERY_SUFFIX_TEMPLATE = "\n\nQuestion: {query}\nAnswer in one concise phrase or sentence.<|im_end|><|im_start|>assistant\n"
 
 
 
@@ -234,12 +234,17 @@ def max_over_golds_em(predictions: List[str], gold_lists: List[List[str]]) -> fl
 
 
 def max_over_golds_f1(predictions: List[str], gold_lists: List[List[str]]) -> float:
-    """F1: average over examples of max token-F1 across gold aliases."""
+    """F1: average over examples of max token-F1 across gold aliases.
+
+    Uses extracted short-answer spans (same as EM) so token overlap is measured
+    against the answer phrase, not a full verbose generation.  This matches standard
+    SQuAD-style evaluation methodology.
+    """
     if not predictions:
         return 0.0
     from metrics import token_f1
     return sum(
-        max((token_f1(p, g) for g in golds), default=0.0)
+        max((token_f1(_extract_short_answer(p), g) for g in golds), default=0.0)
         for p, golds in zip(predictions, gold_lists)
     ) / len(predictions)
 
