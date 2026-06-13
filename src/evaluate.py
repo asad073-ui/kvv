@@ -805,16 +805,18 @@ def main():
                 all_cond_results[condition] = per_ex
                 cond_ex_to_rec[condition]   = ex_to_rec
 
-            # ── Task 7: paired non-refusal mask (intersection across conditions) ──
-            # An example is "paired" only when every condition produced a valid
-            # (non-exception, non-refusal) result.  Faithfulness is scored on this
-            # paired set so hallucination_rate denominators are consistent across
-            # conditions and H1/H2 comparisons are valid.
+            # ── Task 7: paired non-refusal mask (intersection across C1/C2/C3 only) ──
+            # C0 is the oracle upper-bound — its refusal pattern is driven by raw-text
+            # retrieval, not by quantization noise, so including it in the pairing
+            # requirement would incorrectly shrink the faithfulness denominator for H1/H2.
+            # The paired mask covers only the quantization conditions (C1/C2/C3).
+            # C0 is scored separately on its own non-refusal set in Pass 2.
+            quant_conditions = [c for c in args.conditions if c != "C0"]
             paired_mask = [
                 all(
                     all_cond_results[c][i] is not None and not all_cond_results[c][i]["is_refusal"]
-                    for c in args.conditions
-                )
+                    for c in quant_conditions
+                ) if quant_conditions else False
                 for i in range(n_ex)
             ]
             paired_n = sum(paired_mask)
@@ -855,8 +857,15 @@ def main():
                 is_refusals  = [per_ex[i]["is_refusal"] for i in valid_idx]
                 refusal_rate = sum(is_refusals) / max(len(is_refusals), 1)
 
-                # Faithfulness on paired non-refusal set only
-                nr_idx = [i for i in nr_paired_idx if per_ex[i] is not None]
+                # Faithfulness set selection:
+                # C0 uses its own non-refusal examples (oracle has independent refusals).
+                # C1/C2/C3 use the paired set (intersection of non-refusals across all
+                # quant conditions) so hallucination_rate denominators are consistent
+                # and H1/H2 δ comparisons are valid.
+                if condition == "C0":
+                    nr_idx = [i for i in valid_idx if not per_ex[i]["is_refusal"]]
+                else:
+                    nr_idx = [i for i in nr_paired_idx if per_ex[i] is not None]
 
                 hall_rate   = float("nan")
                 ent_score   = float("nan")
