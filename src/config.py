@@ -188,13 +188,15 @@ def config_to_chunk_cache_args(cfg: SimpleNamespace) -> list[str]:
     )
 
     if use_hq_corpus:
-        # Number of HotpotQA questions to harvest paragraphs from.  Use the MVE
-        # example count when MVE is enabled, else 100.
+        # Number of HotpotQA questions to harvest paragraphs from.
         mve = getattr(cfg, "mve", None)
         if getattr(mve, "enabled", False):
             n_ex = getattr(mve, "num_examples", 100)
         else:
-            n_ex = 100
+            # Drive corpus size from the hotpotqa dataset config.
+            # If hotpotqa is in datasets_list use its num_examples; otherwise fall back to 200.
+            hq_entry = getattr(cfg.datasets, "hotpotqa", None)
+            n_ex = getattr(hq_entry, "num_examples", 200) if hq_entry is not None else 200
         args += ["--hotpotqa_corpus", "--hotpotqa_num_examples", str(n_ex)]
     else:
         args += [

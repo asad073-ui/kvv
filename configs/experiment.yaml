@@ -38,7 +38,9 @@ paths:
 
 # ── Retrieval ──────────────────────────────────────────────────────────────────
 retrieval:
-  similarity_top_k: 5   # must be >= max(k_values)
+  # Must be >= max(k_values) so the assert in evaluate.py never fires.
+  # Paper-grade runs add k=10, so keep this at 10 even when k_values=[1,3,5].
+  similarity_top_k: 10
 
 # ── Experimental conditions ────────────────────────────────────────────────────
 conditions:
@@ -54,6 +56,13 @@ k_values: [1, 3, 5]
 # hf_name / hf_config / hf_split: used to load questions from HuggingFace Hub.
 # Set hf_name to null to fall back to query_file (local JSONL).
 datasets:
+  # NOTE: nq_open requires a retrieval corpus with Wikipedia coverage.
+  # The HotpotQA-own-paragraphs corpus (default) has near-zero recall for NQ-Open
+  # questions. To enable NQ-Open evaluation:
+  #   1. Set wiki_docs.download_url to the DPR TSV URL (psgs_w100.tsv.gz)
+  #   2. Set wiki_docs.num_docs to at least 50000 (for meaningful NQ recall)
+  #   3. Expect ~80-100GB of disk for 3-precision chunk caches at that scale.
+  # Until then, run with mve.datasets: ["hotpotqa"] only.
   nq_open:
     hf_name:        "nq_open"
     hf_config:      null
@@ -73,6 +82,9 @@ datasets:
     use_provided_context: true        # build corpus from these questions' paragraphs
     description:    "Multi-hop QA (tests H1 and H2, main benchmark for H2)"
 
+  # NOTE: rgb is a local JSONL dataset (not on HF Hub). Place it at
+  # questions/rgb.jsonl before including it in mve.datasets.
+  # H3 (task-complexity ordering) requires all three datasets to be valid.
   rgb:
     hf_name:        null              # RGB not on standard HF Hub; use local JSONL
     hf_config:      null

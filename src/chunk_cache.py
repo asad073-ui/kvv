@@ -373,6 +373,27 @@ class KVCachedNodeParser:
 
 def main():
     args   = get_args()
+
+    # Task 14: guard against the dead use_flash_attn lever
+    if getattr(args, "use_flash_attn", False):
+        raise ValueError(
+            "use_flash_attn=True is not supported: Qwen2ModifiedAttention always uses "
+            "eager attention to maintain raw-key storage semantics. "
+            "Set use_flash_attn: false in experiment.yaml."
+        )
+
+    # Task 12: global seeding for reproducibility
+    import random as _random
+    import numpy as _np
+    GLOBAL_SEED = 42
+    _random.seed(GLOBAL_SEED)
+    _np.random.seed(GLOBAL_SEED)
+    torch.manual_seed(GLOBAL_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(GLOBAL_SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     os.makedirs(args.output_path, exist_ok=True)
@@ -413,7 +434,11 @@ def main():
     ).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    embed_model = HuggingFaceEmbedding(model_name=args.embedding_model_name)
+    # Task 13: pin embedding model to GPU to avoid multi-hour CPU embedding bottleneck
+    embed_model = HuggingFaceEmbedding(
+        model_name=args.embedding_model_name,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
 
     node_parser = KVCachedNodeParser(
         model=model,

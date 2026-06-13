@@ -67,6 +67,11 @@ class Qwen2ModifiedAttention(Qwen2Attention):
     Drop-in replacement for Qwen2Attention (transformers==4.51.3) that stores raw
     (un-rotated) keys in the DynamicCache and applies RoPE to the full key
     sequence with global position ids at every forward step.
+
+    # NOTE: FlashAttention-2 is intentionally NOT supported here.
+    # Raw (un-rotated) key storage requires the full attention weight matrix
+    # to apply global-position RoPE at inference time. FA2's fused kernel
+    # does not expose intermediate key states. attn_implementation must be "eager".
     """
 
     def __init__(self, config: Qwen2Config, layer_idx: int):

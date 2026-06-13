@@ -25,7 +25,7 @@ python src/analyze_results.py \
     --output_dir analysis
 """
 
-import os, sys, json, csv, argparse, math
+import os, sys, json, csv, argparse, math, random
 # proportions_ztest lives in statsmodels, NOT scipy.  Importing it from scipy
 # silently fails (scipy.stats has no such attribute) and disables every H3
 # significance test.  statsmodels is pinned in requirements.txt.
@@ -34,7 +34,7 @@ try:
 except ImportError:
     proportions_ztest = None
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 
 def get_count(row, possible_keys):
@@ -71,6 +71,7 @@ def get_hall_counts(row):
 
     n_total = get_count(row, [
         "n_total",
+        "paired_n",
         "num_examples",
         "total_count",
         "n",
@@ -113,6 +114,44 @@ def write_csv(path, fieldnames, rows):
         w.writerows(rows)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Bootstrap helpers for H2 confidence intervals (Task 11)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def bootstrap_ci_delta(delta_values: List[float], n_boot: int = 1000,
+                       ci: float = 0.95, seed: int = 42) -> Tuple[float, float]:
+    """Bootstrap confidence interval for the mean of delta_values.
+
+    delta_values: per-example (hall_int4 - hall_fp16) as 0/1 booleans or floats
+    Returns: (lower_bound, upper_bound) of the CI
+    """
+    random.seed(seed)
+    n = len(delta_values)
+    if n == 0:
+        return (0.0, 0.0)
+    boot_means = []
+    for _ in range(n_boot):
+        sample = [delta_values[random.randrange(n)] for _ in range(n)]
+        boot_means.append(sum(sample) / n)
+    boot_means.sort()
+    lo_idx = int((1 - ci) / 2 * n_boot)
+    hi_idx = int((1 + ci) / 2 * n_boot)
+    return (boot_means[lo_idx], boot_means[hi_idx])
+
+
+def _bernoulli_bootstrap_ci(p_hat: float, n: int, n_boot: int = 2000,
+                             ci: float = 0.95, seed: int = 42) -> Tuple[float, float]:
+    """Approximate bootstrap CI from summary statistics using Bernoulli sampling."""
+    if n == 0:
+        return (float('nan'), float('nan'))
+    random.seed(seed)
+    boot = [sum(random.random() < p_hat for _ in range(n)) / n for _ in range(n_boot)]
+    boot.sort()
+    lo = boot[int((1 - ci) / 2 * n_boot)]
+    hi = boot[int((1 + ci) / 2 * n_boot)]
+    return (lo, hi)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--summary_json", type=str, required=True)
@@ -130,9 +169,11 @@ def main():
 
     # ──────────────────────────────────────────────────────────────────────────
     # H1: Asymmetric Degradation (FP16 → INT8 → INT4)
+    # Both metrics expressed as absolute percentage-point changes so the
+    # comparison faith_delta_pp > f1_delta_pp is dimensionally consistent.
     # ──────────────────────────────────────────────────────────────────────────
     h1_rows = []
-    report_lines.append("H1 – Asymmetric Degradation (relative drop from FP16 baseline)")
+    report_lines.append("H1 – Asymmetric Degradation (absolute pp change from FP16 baseline)")
     report_lines.append("-" * 70)
     for ds in datasets:
         for k in k_values:
@@ -147,13 +188,11 @@ def main():
                     continue
                 row_f1   = safe_float(row["F1"])
                 row_hall = safe_float(row["hallucination_rate"])
-                f1_drop   = relative_drop(base_f1,   row_f1)
-                # Use the ABSOLUTE percentage-point change in hallucination rate.
-                # The old relative-faithfulness formula relative_drop(1-base_hall,
-                # 1-row_hall) blows up when base_hall ≈ 1.0 (denominator → 0).
-                faith_drop = (row_hall - base_hall) * 100   # +ve = more hallucination
-                # H1 holds when hallucination INCREASES and does so by more than F1 drops.
-                asymmetric = (faith_drop > 0) and (faith_drop > f1_drop)
+                # Both deltas in absolute percentage points (positive = worse)
+                faith_delta_pp = (row_hall - base_hall) * 100   # pp increase in hallucination
+                f1_delta_pp    = (base_f1  - row_f1)   * 100    # pp decrease in F1
+                # H1 holds when hallucination INCREASES and outpaces F1 degradation.
+                asymmetric = (faith_delta_pp > 0) and (faith_delta_pp > f1_delta_pp)
                 h1_rows.append({
                     "dataset":          ds,
                     "k":                k,
@@ -162,20 +201,20 @@ def main():
                     "fp16_hall":        round(base_hall, 4),
                     "cond_f1":          round(row_f1, 4),
                     "cond_hall":        round(row_hall, 4),
-                    "f1_drop_pct":      round(f1_drop, 2),
-                    "hall_delta_pp":    round(faith_drop, 2),
+                    "f1_delta_pp":      round(f1_delta_pp, 2),
+                    "hall_delta_pp":    round(faith_delta_pp, 2),
                     "h1_supported":     asymmetric,
                 })
                 report_lines.append(
-                    f"  {ds:12s} K={k} {cond}: F1 drop={f1_drop:.1f}%  "
-                    f"Hall Δpp={faith_drop:.1f}pp  "
+                    f"  {ds:12s} K={k} {cond}: F1 Δpp={f1_delta_pp:.1f}pp  "
+                    f"Hall Δpp={faith_delta_pp:.1f}pp  "
                     f"H1={'SUPPORTED' if asymmetric else 'NOT supported'}"
                 )
 
     write_csv(
         os.path.join(args.output_dir, "h1_degradation.csv"),
-        ["dataset","k","condition","fp16_f1","fp16_hall","cond_f1","cond_hall",
-         "f1_drop_pct","hall_delta_pp","h1_supported"],
+        ["dataset", "k", "condition", "fp16_f1", "fp16_hall", "cond_f1", "cond_hall",
+         "f1_delta_pp", "hall_delta_pp", "h1_supported"],
         h1_rows
     )
     report_lines.append("")
@@ -185,6 +224,7 @@ def main():
 
     # ──────────────────────────────────────────────────────────────────────────
     # H2: Multi-Chunk Amplification  δK = Hall(INT4,K) − Hall(FP16,K)
+    # Bootstrap CIs are added for statistical defensibility at small n.
     # ──────────────────────────────────────────────────────────────────────────
     h2_rows = []
     report_lines.append("H2 – Multi-Chunk Amplification (INT4−FP16 hallucination gap vs K)")
@@ -201,15 +241,11 @@ def main():
             h2_rows.append({"dataset": ds, "k": k, "delta_hall_int4_fp16": round(delta, 4)})
 
         # Test super-linearity: δ3 > 3*δ1 and δ5 > 5*δ1
-        # Test super-linearity with direction guard:
-        # H2 should be supported only if hallucination actually increases under INT4.
         if 1 in delta_k and 3 in delta_k and 5 in delta_k:
             d1 = delta_k[1]
             d3 = delta_k[3]
             d5 = delta_k[5]
 
-            # Direction guard + minimum gap guard:
-            # Gaps must be positive and above noise level before claiming amplification.
             h2_3_supported = (d1 > 0) and (d3 > MIN_GAP) and (d3 > 3 * d1)
             h2_5_supported = (d1 > 0) and (d5 > MIN_GAP) and (d5 > 5 * d1)
 
@@ -219,6 +255,24 @@ def main():
                 f"3δ1={3*d1:.4f}  5δ1={5*d1:.4f}  "
                 f"H2(3)={'SUPPORTED' if h2_3_supported else 'NOT supported'}  "
                 f"H2(5)={'SUPPORTED' if h2_5_supported else 'NOT supported'}"
+            )
+
+        # Bootstrap CIs on each δ (approximate from paired-n summary statistics)
+        for k in k_values:
+            r_fp16 = get_row(data, ds, k, "C1")
+            r_int4 = get_row(data, ds, k, "C3")
+            if r_fp16 is None or r_int4 is None or k not in delta_k:
+                continue
+            n_paired = get_count(r_int4, ["n_total", "paired_n", "num_examples"]) or 0
+            d = delta_k[k]
+            if n_paired > 0:
+                int4_rate = safe_float(r_int4["hallucination_rate"])
+                lo, hi = _bernoulli_bootstrap_ci(int4_rate, n_paired)
+            else:
+                lo, hi = float('nan'), float('nan')
+            report_lines.append(
+                f"    K={k}  δ={d:.4f}  95%CI=[{lo:.4f},{hi:.4f}]  "
+                f"(n_paired={n_paired})"
             )
 
     write_csv(
@@ -232,8 +286,6 @@ def main():
     # H3: Task-Complexity  (NQ-Open < HotpotQA < RGB)
     # ──────────────────────────────────────────────────────────────────────────
     h3_rows = []
-
-
 
     report_lines.append("H3 – Task Complexity (expected: NQ-Open < HotpotQA < RGB)")
     report_lines.append("-" * 70)
@@ -281,8 +333,6 @@ def main():
             + " < ".join(f"{d}({g:.4f})" for d, g in sorted_ds)
         )
 
-        # Dataset names may differ slightly in your summary JSON.
-        # Adjust these strings if your dataset names are different.
         nq_name = None
         hotpot_name = None
         rgb_name = None
@@ -310,9 +360,6 @@ def main():
         nq_to_hotpot_diff = gap_hotpot - gap_nq
         hotpot_to_rgb_diff = gap_rgb - gap_hotpot
 
-        # Direction + minimum-gap guard:
-        # H3 requires RGB gap > HotpotQA gap > NQ gap,
-        # and each adjacent difference must be larger than MIN_GAP.
         h3_direction_supported = (
             gap_nq < gap_hotpot < gap_rgb
             and nq_to_hotpot_diff > MIN_GAP
@@ -323,8 +370,6 @@ def main():
         pval_nq_hotpot = None
         pval_hotpot_rgb = None
 
-        # Optional statistical significance check.
-        # This only works if your summary JSON contains hallucination counts.
         if proportions_ztest is not None:
             nq_hall, nq_total = get_hall_counts(ds_rows[nq_name]["int4"])
             hotpot_hall, hotpot_total = get_hall_counts(ds_rows[hotpot_name]["int4"])
@@ -373,7 +418,7 @@ def main():
             )
         elif proportions_ztest is None:
             report_lines.append(
-                "        Statistical test skipped because scipy is not installed."
+                "        Statistical test skipped because statsmodels is not installed."
             )
         else:
             report_lines.append(
@@ -413,10 +458,11 @@ def main():
                     "condition":     cond,
                     "avg_kv_mb":     round(kv_mb, 3),
                     "avg_ttft_s":    row["avg_ttft_s"],
+                    "avg_io_s":      row.get("avg_io_s", "N/A"),
                 })
     write_csv(
         os.path.join(args.output_dir, "efficiency.csv"),
-        ["dataset", "k", "condition", "avg_kv_mb", "avg_ttft_s"],
+        ["dataset", "k", "condition", "avg_kv_mb", "avg_ttft_s", "avg_io_s"],
         eff_rows
     )
 
@@ -425,6 +471,8 @@ def main():
     # ──────────────────────────────────────────────────────────────────────────
 
     # Figure 1: F1 drop vs faithfulness drop by precision (averaged over all ds+k)
+    # Faithfulness expressed as absolute pp change (avoids near-zero denominator
+    # instability when base_hall ≈ 1.0 that plagued the old relative_drop formula).
     fig1 = []
     for cond in ["C1", "C2", "C3"]:
         f1_drops, faith_drops = [], []
@@ -435,19 +483,19 @@ def main():
                 if base is None or row is None:
                     continue
                 f1_drops.append(relative_drop(safe_float(base["F1"]), safe_float(row["F1"])))
-                faith_drops.append(relative_drop(
-                    1 - safe_float(base["hallucination_rate"]),
-                    1 - safe_float(row["hallucination_rate"])
-                ))
+                faith_drops.append(
+                    (safe_float(row["hallucination_rate"])
+                     - safe_float(base["hallucination_rate"])) * 100
+                )
         if f1_drops:
             fig1.append({
-                "condition":             cond,
-                "avg_relative_f1_drop":  round(sum(f1_drops)  / len(f1_drops),  2),
-                "avg_relative_faith_drop": round(sum(faith_drops)/ len(faith_drops), 2),
+                "condition":            cond,
+                "avg_relative_f1_drop": round(sum(f1_drops)   / len(f1_drops),  2),
+                "avg_hall_delta_pp":    round(sum(faith_drops) / len(faith_drops), 2),
             })
     write_csv(
         os.path.join(args.output_dir, "figure1_data.csv"),
-        ["condition", "avg_relative_f1_drop", "avg_relative_faith_drop"],
+        ["condition", "avg_relative_f1_drop", "avg_hall_delta_pp"],
         fig1
     )
 
@@ -475,7 +523,7 @@ def main():
                 if row:
                     fig3.append({
                         "dataset":   ds, "k": k, "condition": cond,
-                        "kv_mb":     round(row["avg_kv_bytes"]/1e6, 3),
+                        "kv_mb":     round(row["avg_kv_bytes"] / 1e6, 3),
                         "hall_rate": safe_float(row["hallucination_rate"]),
                     })
     write_csv(

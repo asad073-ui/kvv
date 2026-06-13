@@ -214,3 +214,61 @@ def mean_entailment(nli_scores: List[Tuple[float, float, float]]) -> float:
     if not nli_scores:
         return 0.0
     return sum(e for e, _, _ in nli_scores) / len(nli_scores)
+
+
+def hallucination_rate_per_chunk(
+    hhem_scorer,
+    chunk_texts_list: List[List[str]],
+    answers: List[str],
+    batch_size: int = 8,
+    threshold: float = 0.5,
+) -> Tuple[List[float], List[bool]]:
+    """Score faithfulness per-chunk and return max faithfulness score per example.
+
+    Scores each (chunk, answer) pair independently and takes the max faithfulness
+    across chunks. Semantically: "is the answer faithful to ANY retrieved chunk?"
+    This avoids the K-dependent truncation artifact where the evidence chunk is
+    cut off when context is concatenated before trimming.
+
+    Returns:
+        faith_scores: List[float] — max faithfulness across chunks, per example
+        hallucinated: List[bool]  — True if max_faith < threshold
+    """
+    faith_scores = []
+    for chunks, answer in zip(chunk_texts_list, answers):
+        if not chunks:
+            faith_scores.append(0.0)
+            continue
+        trimmed_chunks = [c[:1600] for c in chunks]
+        pairs = [(c, answer) for c in trimmed_chunks]
+        per_chunk: List[float] = []
+        for i in range(0, len(pairs), batch_size):
+            scores = hhem_scorer.model.predict(pairs[i:i + batch_size])
+            per_chunk.extend(scores.tolist())
+        faith_scores.append(max(per_chunk))
+    hallucinated = [s < threshold for s in faith_scores]
+    return faith_scores, hallucinated
+
+
+def entailment_per_chunk(
+    nli_scorer,
+    chunk_texts_list: List[List[str]],
+    answers: List[str],
+    batch_size: int = 8,
+) -> List[Tuple[float, float, float]]:
+    """Max-entailment across chunks per example.
+
+    Scores each (chunk, answer) pair with the NLI model and returns the
+    (entailment, neutral, contradiction) triple that has the highest entailment
+    probability. Avoids the K-dependent truncation artifact.
+    """
+    results = []
+    for chunks, answer in zip(chunk_texts_list, answers):
+        if not chunks:
+            results.append((0.0, 0.0, 1.0))
+            continue
+        trimmed = [c[:800] for c in chunks]
+        per_chunk = nli_scorer.batch_score(trimmed, [answer] * len(trimmed), batch_size)
+        best = max(per_chunk, key=lambda t: t[0])
+        results.append(best)
+    return results

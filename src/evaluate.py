@@ -18,9 +18,13 @@ Design (transformers==4.51.3)
     4.51.3's generate() recomputes cache_position as arange(input_len)[past_len:],
     which is empty when the pre-filled cache is longer than the suffix.
   * Everything runs in float16 (T4 / sm_75 has no native bfloat16).
-  * Refusals ("I can not answer …") are tracked separately and excluded from the
-    HHEM / NLI faithfulness scoring (they are retrieval failures, not
-    hallucinations); EM / F1 still include them.
+  * Refusals ("I can not answer …") are tracked separately and PAIRED across
+    conditions before faithfulness scoring, so hallucination_rate denominators
+    are consistent and H1/H2 comparisons are valid.
+  * NQ-Open multi-answer: gold answers are kept as a list; EM/F1/contain_EM use
+    max-over-golds scoring.
+  * Faithfulness is scored per-chunk (max across chunks) to avoid the K-dependent
+    truncation artifact that would otherwise inflate hallucination at high K.
 """
 
 
@@ -33,11 +37,15 @@ import argparse
 import csv
 import math
 import re
+import random
+import platform
+import subprocess
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 
 import torch
+import numpy as np
 from tqdm import tqdm
 from tabulate import tabulate
 
@@ -53,6 +61,7 @@ from metrics import (
     batch_em, batch_f1,
     HHEMScorer, DeBERTaNLIScorer,
     hallucination_rate, mean_entailment,
+    hallucination_rate_per_chunk, entailment_per_chunk,
     _normalize as _normalize_answer,
 )
 
@@ -65,6 +74,8 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+
+GLOBAL_SEED = 42
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -210,16 +221,40 @@ def _extract_short_answer(text: str) -> str:
 
 
 
-def batch_contain_em(predictions: List[str], ground_truths: List[str]) -> float:
-    """
-    FIX-5: Contain-EM — fraction where normalised gold is a substring of
-    normalised prediction.
+def max_over_golds_em(predictions: List[str], gold_lists: List[List[str]]) -> float:
+    """EM: fraction of predictions that exactly match ANY gold alias."""
+    if not predictions:
+        return 0.0
+    from metrics import exact_match
+    return sum(
+        max((exact_match(_extract_short_answer(p), g) for g in golds), default=0)
+        for p, golds in zip(predictions, gold_lists)
+    ) / len(predictions)
+
+
+
+def max_over_golds_f1(predictions: List[str], gold_lists: List[List[str]]) -> float:
+    """F1: average over examples of max token-F1 across gold aliases."""
+    if not predictions:
+        return 0.0
+    from metrics import token_f1
+    return sum(
+        max((token_f1(p, g) for g in golds), default=0.0)
+        for p, golds in zip(predictions, gold_lists)
+    ) / len(predictions)
+
+
+
+def batch_contain_em(predictions: List[str], gold_lists: List[List[str]]) -> float:
+    """Contain-EM: fraction where normalised gold is a substring of normalised prediction.
+
+    Checks if ANY gold alias is contained (max-over-golds).
     """
     if not predictions:
         return 0.0
     return sum(
-        1 for p, g in zip(predictions, ground_truths)
-        if _normalize_answer(g) in _normalize_answer(p)
+        1 for p, golds in zip(predictions, gold_lists)
+        if any(_normalize_answer(g) in _normalize_answer(p) for g in golds)
     ) / len(predictions)
 
 
@@ -346,6 +381,35 @@ CONDITION_LABELS = {
 
 
 
+def _move_compressed_to_device(compressed: list, device: torch.device) -> list:
+    """Move compressed KV cache tensors to `device` before dequantization.
+
+    For FP16: moves the raw float16 tensors.
+    For INT8: moves quantized (uint8), scale (fp32), zero_point (int32).
+    For INT4: moves packed (uint8) and scale (fp32).
+    Operates on the list-of-dicts structure from compress_kvcache().
+    Running dequantization on GPU (bit-unpacking, scale multiply) is faster and
+    avoids a large transient on-GPU memory spike from loading already-inflated tensors.
+    """
+    moved = []
+    for layer_data in compressed:
+        new_layer = {}
+        for kv_key in ("k", "v"):
+            d = layer_data[kv_key]
+            if isinstance(d, torch.Tensor):
+                new_layer[kv_key] = d.to(device)
+            elif isinstance(d, dict):
+                new_layer[kv_key] = {
+                    dk: dv.to(device) if isinstance(dv, torch.Tensor) else dv
+                    for dk, dv in d.items()
+                }
+            else:
+                new_layer[kv_key] = d
+        moved.append(new_layer)
+    return moved
+
+
+
 def run_query(
     query: str,
     retrieved_nodes,
@@ -359,27 +423,34 @@ def run_query(
     """
     Run a single query under a given condition.
 
+    Returns io_seconds (disk load + dequant) and ttft_seconds (first model forward
+    to first token) separately so callers can attribute latency correctly.
+
     prefix_kvcache is shared (read-only) across all queries.  stack_past_key_values
-    materialises brand-new tensors via torch.cat, so the prefix is never mutated —
-    no deep-copy needed.  Chunk caches are loaded onto CPU then moved to `device`
-    so they cat cleanly with the on-device prefix (same device AND same float16
-    dtype, avoiding the historical bf16/fp16 + cuda/cpu mismatch crashes).
+    materialises brand-new tensors via torch.cat, so the prefix is never mutated.
     """
     nodes_k       = retrieved_nodes[:k]
     precision     = PRECISION_MAP[condition]
     chunk_texts   = []
     kv_size_bytes = 0
 
-    t0 = time.perf_counter()
-
     if condition == "C0":
+        # Task 5: wrap raw text with the same delimiters used for C1-C3 chunk caches
+        # so C0 and C1 differ only by retrieval condition (not by delimiter tokens).
         for nws in nodes_k:
-            chunk_texts.append(nws.node.metadata.get("raw_text", nws.node.text))
+            raw = nws.node.metadata.get("raw_text", nws.node.text)
+            chunk_texts.append(f"<|doc_start|>{raw}<|doc_end|>")
+
+        io_time = 0.0
+        ttft_start = time.perf_counter()
         answer = generate_with_cache(model, tokenizer, device, None, query, chunk_texts)
+        ttft = time.perf_counter() - ttft_start
 
     else:
         kvcache_list = [prefix_kvcache]
 
+        # Task 4: measure disk I/O + dequant separately from model forward
+        io_start = time.perf_counter()
         for nws in nodes_k:
             node      = nws.node
             cache_key = f"kvcache_{precision}"
@@ -396,25 +467,31 @@ def run_query(
                     f"Cache file not found: '{fpath}'. Re-run --stages build."
                 )
 
-            # Compressed caches are dicts with mixed Python types → weights_only=False.
-            # map_location="cpu" avoids a GPU OOM spike while loading.
-            compressed = torch.load(fpath, map_location="cpu", weights_only=False)
-            legacy     = decompress_kvcache(compressed, precision)
-            # Move chunk tensors onto the model device so they cat with the prefix.
-            legacy     = tuple((k.to(device), v.to(device)) for k, v in legacy)
+            # Task 3: Load to CPU first (avoids GPU OOM spike on large caches),
+            # then move the compressed dict's tensors to device BEFORE dequantization
+            # so that all INT4/INT8 arithmetic (bit-unpacking, scale multiply) runs on GPU.
+            compressed_cpu = torch.load(fpath, map_location="cpu", weights_only=False)
+            compressed = _move_compressed_to_device(compressed_cpu, device)
+            legacy = decompress_kvcache(compressed, precision)
+            # Safety cast: ensure tensors are on device with float16 dtype.
+            legacy = tuple((kk.to(device), v.to(device)) for kk, v in legacy)
             kvcache_list.append(legacy_to_dynamic(legacy))
             chunk_texts.append(node.metadata.get("raw_text", node.text))
             kv_size_bytes += cache_size_bytes(compressed, precision)
 
         stitched = stack_past_key_values(kvcache_list)
-        answer   = generate_with_cache(model, tokenizer, device, stitched, query, [])
+        io_time = time.perf_counter() - io_start
 
-    ttft = time.perf_counter() - t0
+        ttft_start = time.perf_counter()
+        answer = generate_with_cache(model, tokenizer, device, stitched, query, [])
+        ttft = time.perf_counter() - ttft_start
 
     return {
         "answer":        answer,
-        "context":       "\n\n".join(chunk_texts),   # FIX-2
+        "context":       "\n\n".join(chunk_texts),
+        "chunk_texts":   chunk_texts,           # per-chunk list for per-chunk faithfulness scoring
         "ttft_seconds":  ttft,
+        "io_seconds":    io_time,
         "kv_size_bytes": kv_size_bytes,
     }
 
@@ -447,15 +524,24 @@ def _load_from_hf(
         if num_examples != -1 and len(examples) >= num_examples:
             break
         q = row.get(question_field) or row.get("question", "")
-        a = row.get(answer_field)   or row.get("answer", "")
-        # FIX-8: peel nested list/dict until plain string
-        while isinstance(a, list):
-            a = a[0] if a else ""
-        if isinstance(a, dict):
-            a = a.get("text", "") or a.get("answer", "")
-            while isinstance(a, list):
-                a = a[0] if a else ""
-        examples.append({"query": q, "answer": str(a)})
+        # Task 6: keep full answer list for multi-answer datasets (e.g. NQ-Open).
+        a_raw = row.get(answer_field) or row.get("answer", "")
+        if isinstance(a_raw, list) and all(isinstance(x, str) for x in a_raw):
+            # Multi-answer: keep the full list for max-over-golds scoring.
+            a_normalized = a_raw
+        elif isinstance(a_raw, list):
+            a_raw = a_raw[0] if a_raw else ""
+            while isinstance(a_raw, list):
+                a_raw = a_raw[0] if a_raw else ""
+            a_normalized = [str(a_raw)]
+        elif isinstance(a_raw, dict):
+            a_raw = a_raw.get("text", "") or a_raw.get("answer", "")
+            while isinstance(a_raw, list):
+                a_raw = a_raw[0] if a_raw else ""
+            a_normalized = [str(a_raw)]
+        else:
+            a_normalized = [str(a_raw)]
+        examples.append({"query": q, "answer": a_normalized})
     return examples
 
 
@@ -466,10 +552,23 @@ def _load_from_jsonl(query_file: str, num_examples: int) -> List[Dict]:
         for line in f:
             data   = json.loads(line.strip())
             query  = data.get("query") or data.get("question", "")
-            answer = data.get("answer") or data.get("answers", "")
-            while isinstance(answer, list):
-                answer = answer[0] if answer else ""
-            examples.append({"query": query, "answer": answer})
+            a_raw  = data.get("answer") or data.get("answers", "")
+            # Task 6: same multi-answer normalization as _load_from_hf.
+            if isinstance(a_raw, list) and all(isinstance(x, str) for x in a_raw):
+                a_normalized = a_raw
+            elif isinstance(a_raw, list):
+                a_raw = a_raw[0] if a_raw else ""
+                while isinstance(a_raw, list):
+                    a_raw = a_raw[0] if a_raw else ""
+                a_normalized = [str(a_raw)]
+            elif isinstance(a_raw, dict):
+                a_raw = a_raw.get("text", "") or a_raw.get("answer", "")
+                while isinstance(a_raw, list):
+                    a_raw = a_raw[0] if a_raw else ""
+                a_normalized = [str(a_raw)]
+            else:
+                a_normalized = [str(a_raw)]
+            examples.append({"query": query, "answer": a_normalized})
             if num_examples != -1 and len(examples) >= num_examples:
                 break
     return examples
@@ -488,6 +587,29 @@ def load_dataset_examples(
         return _load_from_jsonl(query_file, num_examples)
     raise ValueError(f"Dataset '{dataset_name}': provide either --hf_names or --query_files")
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Metadata capture helpers (Task 12)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _get_git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def _get_pip_freeze() -> List[str]:
+    try:
+        return subprocess.check_output(
+            [sys.executable, "-m", "pip", "freeze"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip().split("\n")
+    except Exception:
+        return []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -518,11 +640,28 @@ def main():
     parser.add_argument("--output_dir",       type=str, default="results")
     parser.add_argument("--eval_hhem",        action="store_true")
     parser.add_argument("--eval_nli",         action="store_true")
-    parser.add_argument("--similarity_top_k", type=int, default=5)
+    parser.add_argument("--similarity_top_k", type=int, default=10)
     args = parser.parse_args()
+
+    # Task 14: guard against the dead use_flash_attn lever
+    if getattr(args, "use_flash_attn", False):
+        raise ValueError(
+            "use_flash_attn=True is not supported: Qwen2ModifiedAttention always uses "
+            "eager attention to maintain raw-key storage semantics. "
+            "Set use_flash_attn: false in experiment.yaml."
+        )
 
     assert args.similarity_top_k >= max(args.k_values), \
         "--similarity_top_k must be >= max(k_values)"
+
+    # Task 12: global seeding for reproducibility
+    random.seed(GLOBAL_SEED)
+    np.random.seed(GLOBAL_SEED)
+    torch.manual_seed(GLOBAL_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(GLOBAL_SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     log.info(f"transformers version: {transformers.__version__}  "
              f"(DynamicCache via to_legacy_cache/from_legacy_cache)")
@@ -548,11 +687,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Device: {device}")
 
-    attn_impl = "flash_attention_2" if args.use_flash_attn else "eager"
+    attn_impl = "eager"  # use_flash_attn is guarded above; always eager here
     log.info(f"Loading model: {args.model_name} (attn={attn_impl})")
 
-    # T4 (sm_75): float16 throughout, never bfloat16.  torch_dtype= is the correct
-    # kwarg on transformers 4.51.3 (dtype= is the later alias).
+    # T4 (sm_75): float16 throughout, never bfloat16.
     model = Qwen2ModifiedForCausalLM.from_pretrained(
         args.model_name,
         attn_implementation=attn_impl,
@@ -563,8 +701,6 @@ def main():
     log.info("Pre-computing system prefix KV cache ...")
     prefix_inputs = tokenizer([SYSTEM_PROMPT], return_tensors="pt")
     with torch.no_grad():
-        # use_cache=True → Qwen2Model auto-creates a DynamicCache; the modified
-        # attention stores RAW (un-rotated) keys in it, matching the chunk caches.
         prefix_out = model(
             prefix_inputs["input_ids"].to(device),
             attention_mask=prefix_inputs["attention_mask"].to(device),
@@ -583,7 +719,11 @@ def main():
     )
 
     log.info("Loading retrieval index ...")
-    Settings.embed_model = HuggingFaceEmbedding(model_name=args.embedding_model_name)
+    # Task 13: pin embedding model to GPU to avoid multi-hour CPU bottleneck
+    Settings.embed_model = HuggingFaceEmbedding(
+        model_name=args.embedding_model_name,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
     storage_ctx = StorageContext.from_defaults(persist_dir=args.storage_dir)
     index       = load_index_from_storage(storage_ctx)
     retriever   = index.as_retriever(similarity_top_k=args.similarity_top_k)
@@ -594,6 +734,7 @@ def main():
     all_records  = []
     summary_rows = []
 
+    # ── Outer loop: datasets ──────────────────────────────────────────────────
     for ds_name, qfile, hf_name, hf_cfg, hf_split, q_field, a_field, n_examples in zip(
         args.datasets, query_files, hf_names, hf_configs,
         hf_splits, question_fields, answer_fields, num_examples_list,
@@ -605,17 +746,23 @@ def main():
             question_field=q_field, answer_field=a_field, hf_cache_dir=args.hf_cache_dir,
         )
         log.info(f"  {len(examples)} examples loaded")
+        n_ex = len(examples)
 
         for k in args.k_values:
-            for condition in args.conditions:
-                log.info(f"  Condition={condition}  K={k}")
-                preds, refs, contexts = [], [], []
-                ttft_list, kv_size_list = [], []
-                record_start_idx = len(all_records)  # FIX-HHEM-IDX
+            # ── Pass 1: collect per-condition per-example results ──────────────
+            # all_cond_results[condition][i] is either a dict of results or None
+            # (if the example raised an exception).  Keeping the per-example
+            # structure lets us compute the refusal intersection mask in Pass 2.
+            all_cond_results: Dict[str, List[Optional[Dict]]] = {}
+            cond_ex_to_rec:   Dict[str, Dict[int, int]]       = {}  # condition->ex_idx->rec_idx
 
-                for ex in tqdm(examples, desc=f"{ds_name} K={k} {condition}"):
+            for condition in args.conditions:
+                per_ex: List[Optional[Dict]] = [None] * n_ex
+                ex_to_rec: Dict[int, int]    = {}
+
+                for i, ex in enumerate(tqdm(examples, desc=f"{ds_name} K={k} {condition}")):
                     query  = ex["query"]
-                    answer = ex["answer"]
+                    answer = ex["answer"]   # List[str] after Task 6 loaders
                     try:
                         qb    = QueryBundle(query_str=query)
                         nodes = retriever.retrieve(qb)
@@ -624,84 +771,128 @@ def main():
                             condition=condition, model=model, tokenizer=tokenizer,
                             device=device, prefix_kvcache=prefix_kvcache,
                         )
-                        preds.append(result["answer"])
-                        refs.append(answer)
-                        contexts.append(result["context"])
-                        ttft_list.append(result["ttft_seconds"])
-                        kv_size_list.append(result["kv_size_bytes"])
+                        is_refusal = REFUSAL_MARKER in result["answer"]
+                        per_ex[i] = {
+                            "answer":      result["answer"],
+                            "context":     result["context"],
+                            "chunk_texts": result["chunk_texts"],
+                            "ttft":        result["ttft_seconds"],
+                            "io_seconds":  result["io_seconds"],
+                            "kv_bytes":    result["kv_size_bytes"],
+                            "is_refusal":  is_refusal,
+                        }
+                        rec_idx = len(all_records)
                         all_records.append({
                             "dataset":    ds_name,
                             "k":          k,
                             "condition":  condition,
                             "query":      query,
-                            "gold":       answer,
+                            "gold":       answer,   # serializes fine as JSON list
                             "prediction": result["answer"],
                             "context":    result["context"],
                             "ttft":       result["ttft_seconds"],
+                            "io_seconds": result["io_seconds"],
                             "kv_bytes":   result["kv_size_bytes"],
-                            "is_refusal": REFUSAL_MARKER in result["answer"],
+                            "is_refusal": is_refusal,
                         })
+                        ex_to_rec[i] = rec_idx
                     except Exception as e:
-                        # FIX-ERRLOG
                         log.error(
-                            f"Skipped query [{ds_name} K={k} {condition}]: {e}",
+                            f"Skipped query [{ds_name} K={k} {condition} example={i}]: {e}",
                             exc_info=True,
                         )
 
-                # FIX-EM: EM uses extracted short answer spans; F1 uses raw preds.
-                em_preds   = [_extract_short_answer(p) for p in preds]
-                f1_score   = batch_f1(preds, refs)
-                em_score   = batch_em(em_preds, refs)
+                all_cond_results[condition] = per_ex
+                cond_ex_to_rec[condition]   = ex_to_rec
+
+            # ── Task 7: paired non-refusal mask (intersection across conditions) ──
+            # An example is "paired" only when every condition produced a valid
+            # (non-exception, non-refusal) result.  Faithfulness is scored on this
+            # paired set so hallucination_rate denominators are consistent across
+            # conditions and H1/H2 comparisons are valid.
+            paired_mask = [
+                all(
+                    all_cond_results[c][i] is not None and not all_cond_results[c][i]["is_refusal"]
+                    for c in args.conditions
+                )
+                for i in range(n_ex)
+            ]
+            paired_n = sum(paired_mask)
+            nr_paired_idx = [i for i in range(n_ex) if paired_mask[i]]
+
+            # ── Pass 2: compute metrics per condition ──────────────────────────
+            for condition in args.conditions:
+                per_ex    = all_cond_results[condition]
+                ex_to_rec = cond_ex_to_rec[condition]
+
+                # Valid examples (no exception) — used for EM / F1 / timing
+                valid_idx = [i for i, r in enumerate(per_ex) if r is not None]
+                preds = [per_ex[i]["answer"] for i in valid_idx]
+                refs  = [examples[i]["answer"] for i in valid_idx]  # List[List[str]]
+
+                # EM/F1 run over ALL valid examples (refusals count as wrong answers)
+                em_score   = max_over_golds_em(preds, refs)
+                f1_score   = max_over_golds_f1(preds, refs)
                 contain_em = batch_contain_em(preds, refs)
 
                 if preds and log.isEnabledFor(logging.DEBUG):
-                    for i in range(min(3, len(preds))):
+                    for ii in range(min(3, len(preds))):
                         log.debug(
-                            "  [%d] raw=%r  extracted=%r  gold=%r  em=%d",
-                            i, preds[i][:80], em_preds[i], refs[i],
-                            1 if _normalize_answer(em_preds[i]) == _normalize_answer(refs[i]) else 0,
+                            "  [%d] raw=%r  extracted=%r  gold=%r",
+                            ii, preds[ii][:80],
+                            _extract_short_answer(preds[ii]),
+                            refs[ii],
                         )
 
-                # FIX-NAN
-                avg_ttft = (sum(ttft_list) / len(ttft_list)) if ttft_list else float("nan")
-                avg_kv   = (sum(kv_size_list) / len(kv_size_list)) if kv_size_list else 0
+                ttft_list = [per_ex[i]["ttft"]      for i in valid_idx]
+                io_list   = [per_ex[i]["io_seconds"] for i in valid_idx]
+                kv_list   = [per_ex[i]["kv_bytes"]   for i in valid_idx]
 
-                # ── Refusals: tracked separately, excluded from faithfulness ──
-                # A refusal means retrieval gave irrelevant context; counting it as
-                # a hallucination would bias every hall_rate upward and make H1/H2
-                # uninterpretable.  EM/F1 still include refusals (they are wrong
-                # answers); only HHEM/NLI exclude them.
-                is_refusals  = [REFUSAL_MARKER in p for p in preds]
-                refusal_rate = sum(is_refusals) / max(len(preds), 1)
-                nr_idx       = [i for i, r in enumerate(is_refusals) if not r]
+                avg_ttft = sum(ttft_list) / len(ttft_list) if ttft_list else float("nan")
+                avg_io   = sum(io_list)   / len(io_list)   if io_list   else float("nan")
+                avg_kv   = sum(kv_list)   / len(kv_list)   if kv_list   else 0
 
-                hall_rate = float("nan")
-                ent_score = float("nan")
-                n_hall    = 0
-                n_total   = len(nr_idx)
+                is_refusals  = [per_ex[i]["is_refusal"] for i in valid_idx]
+                refusal_rate = sum(is_refusals) / max(len(is_refusals), 1)
+
+                # Faithfulness on paired non-refusal set only
+                nr_idx = [i for i in nr_paired_idx if per_ex[i] is not None]
+
+                hall_rate   = float("nan")
+                ent_score   = float("nan")
+                n_hall      = 0
+                n_total     = len(nr_idx)
                 HHEM_THRESHOLD = 0.5
-                matching = all_records[record_start_idx:]
 
+                # Task 8: per-chunk scoring — avoids K-dependent truncation artifact
                 if hhem_scorer and nr_idx:
-                    nr_contexts  = [trim_context_for_hhem(contexts[i]) for i in nr_idx]
-                    nr_preds     = [preds[i] for i in nr_idx]
-                    faith_scores = hhem_scorer.batch_score(nr_contexts, nr_preds)
-                    hall_rate    = hallucination_rate(faith_scores)
-                    n_total      = len(faith_scores)
-                    n_hall       = sum(1 for s in faith_scores if s < HHEM_THRESHOLD)
+                    chunk_texts_list = [per_ex[i]["chunk_texts"] for i in nr_idx]
+                    nr_preds         = [per_ex[i]["answer"]      for i in nr_idx]
+                    faith_scores, hallucinated_flags = hallucination_rate_per_chunk(
+                        hhem_scorer, chunk_texts_list, nr_preds,
+                        threshold=HHEM_THRESHOLD,
+                    )
+                    hall_rate = sum(hallucinated_flags) / len(hallucinated_flags)
+                    n_total   = len(hallucinated_flags)
+                    n_hall    = sum(hallucinated_flags)
                     for j, i in enumerate(nr_idx):
-                        matching[i]["hhem_faithfulness"] = faith_scores[j]
-                        matching[i]["hhem_hallucinated"] = faith_scores[j] < HHEM_THRESHOLD
+                        rec_idx = ex_to_rec.get(i)
+                        if rec_idx is not None:
+                            all_records[rec_idx]["hhem_faithfulness"] = faith_scores[j]
+                            all_records[rec_idx]["hhem_hallucinated"] = hallucinated_flags[j]
 
                 if nli_scorer and nr_idx:
-                    nr_contexts = [trim_context_for_hhem(contexts[i], max_tokens=200) for i in nr_idx]
-                    nr_preds    = [preds[i] for i in nr_idx]
-                    nli_scores  = nli_scorer.batch_score(nr_contexts, nr_preds)
-                    ent_score   = mean_entailment(nli_scores)
+                    chunk_texts_list = [per_ex[i]["chunk_texts"] for i in nr_idx]
+                    nr_preds         = [per_ex[i]["answer"]      for i in nr_idx]
+                    nli_scores = entailment_per_chunk(nli_scorer, chunk_texts_list, nr_preds)
+                    ent_score  = sum(e for e, _, _ in nli_scores) / len(nli_scores) \
+                                 if nli_scores else float("nan")
                     for j, i in enumerate(nr_idx):
-                        matching[i]["nli_entailment"]    = nli_scores[j][0]
-                        matching[i]["nli_neutral"]       = nli_scores[j][1]
-                        matching[i]["nli_contradiction"] = nli_scores[j][2]
+                        rec_idx = ex_to_rec.get(i)
+                        if rec_idx is not None:
+                            all_records[rec_idx]["nli_entailment"]    = nli_scores[j][0]
+                            all_records[rec_idx]["nli_neutral"]       = nli_scores[j][1]
+                            all_records[rec_idx]["nli_contradiction"] = nli_scores[j][2]
 
                 row = {
                     "dataset":            ds_name,
@@ -711,6 +902,7 @@ def main():
                     "n_examples":         len(preds),
                     "n_hall":             n_hall,
                     "n_total":            n_total,
+                    "paired_n":           paired_n,
                     "refusal_rate":       round(refusal_rate, 4),
                     "EM":                 round(em_score,   4),
                     "contain_EM":         round(contain_em, 4),
@@ -718,15 +910,18 @@ def main():
                     "hallucination_rate": round(hall_rate, 4) if not math.isnan(hall_rate) else "N/A",
                     "entailment_score":   round(ent_score,  4) if not math.isnan(ent_score)  else "N/A",
                     "avg_ttft_s":         round(avg_ttft, 4) if not math.isnan(avg_ttft) else "N/A",
+                    "avg_io_s":           round(avg_io,   4) if not math.isnan(avg_io)   else "N/A",
                     "avg_kv_bytes":       int(avg_kv),
                 }
                 summary_rows.append(row)
                 log.info(
                     f"    n={len(preds)}  EM={em_score:.3f}  ContEM={contain_em:.3f}  "
                     f"F1={f1_score:.3f}  Refuse={refusal_rate:.3f}  "
+                    f"Paired={paired_n}  "
                     f"Hall={'N/A' if math.isnan(hall_rate) else f'{hall_rate:.3f}'}  "
                     f"Ent={'N/A' if math.isnan(ent_score) else f'{ent_score:.3f}'}  "
                     f"TTFT={'N/A' if math.isnan(avg_ttft) else f'{avg_ttft:.3f}s'}  "
+                    f"IO={'N/A' if math.isnan(avg_io) else f'{avg_io:.3f}s'}  "
                     f"KV={avg_kv/1e6:.2f}MB"
                 )
 
@@ -736,11 +931,13 @@ def main():
             f.write(json.dumps(rec) + "\n")
     log.info(f"Raw records → {raw_path}")
 
-    # ── Write summary CSV (FIX-CSV) ──────────────────────────────────────────
+    # ── Write summary CSV ────────────────────────────────────────────────────
     fieldnames = [
         "dataset", "k", "condition", "condition_label", "n_examples",
-        "n_hall", "n_total", "refusal_rate", "EM", "contain_EM", "F1",
-        "hallucination_rate", "entailment_score", "avg_ttft_s", "avg_kv_bytes",
+        "n_hall", "n_total", "paired_n", "refusal_rate",
+        "EM", "contain_EM", "F1",
+        "hallucination_rate", "entailment_score",
+        "avg_ttft_s", "avg_io_s", "avg_kv_bytes",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
@@ -757,14 +954,33 @@ def main():
         json.dump(summary_rows, f, indent=2)
     log.info(f"Summary JSON → {json_path}")
 
+    # ── Task 12: Write experiment metadata ───────────────────────────────────
+    meta = {
+        "git_commit":             _get_git_commit(),
+        "python_version":         sys.version,
+        "platform":               platform.platform(),
+        "torch_version":          torch.__version__,
+        "transformers_version":   transformers.__version__,
+        "cuda_available":         torch.cuda.is_available(),
+        "cuda_device":            torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none",
+        "global_seed":            GLOBAL_SEED,
+        "pip_freeze":             _get_pip_freeze(),
+        "resolved_args":          vars(args),
+        "timestamp":              timestamp,
+    }
+    meta_path = os.path.join(args.output_dir, f"meta_{timestamp}.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    log.info(f"Experiment metadata → {meta_path}")
+
     # ── Print table ──────────────────────────────────────────────────────────
-    headers = ["Dataset", "K", "Cond", "n", "Refuse", "EM", "ContEM", "F1",
-               "Hall↓", "Ent↑", "TTFT(s)", "KV(MB)"]
+    headers = ["Dataset", "K", "Cond", "n", "Paired", "Refuse",
+               "EM", "ContEM", "F1", "Hall↓", "Ent↑", "TTFT(s)", "IO(s)", "KV(MB)"]
     table = [
-        [r["dataset"], r["k"], r["condition"], r["n_examples"], r["refusal_rate"],
-         r["EM"], r["contain_EM"], r["F1"],
+        [r["dataset"], r["k"], r["condition"], r["n_examples"], r["paired_n"],
+         r["refusal_rate"], r["EM"], r["contain_EM"], r["F1"],
          r["hallucination_rate"], r["entailment_score"],
-         r["avg_ttft_s"], round(r["avg_kv_bytes"] / 1e6, 2)]
+         r["avg_ttft_s"], r["avg_io_s"], round(r["avg_kv_bytes"] / 1e6, 2)]
         for r in summary_rows
     ]
     print("\n" + tabulate(table, headers=headers, tablefmt="grid"))

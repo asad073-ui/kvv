@@ -78,6 +78,19 @@ def stage_build(cfg, args):
 
 def stage_eval(cfg, args):
     print("\n━━━ Stage: Evaluate All Conditions ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    # Seed the orchestration process for reproducibility; evaluate.py seeds itself.
+    import random as _random
+    import numpy as _np
+    import torch as _torch
+    GLOBAL_SEED = 42
+    _random.seed(GLOBAL_SEED)
+    _np.random.seed(GLOBAL_SEED)
+    _torch.manual_seed(GLOBAL_SEED)
+    if _torch.cuda.is_available():
+        _torch.cuda.manual_seed_all(GLOBAL_SEED)
+    _torch.backends.cudnn.deterministic = True
+    _torch.backends.cudnn.benchmark = False
+
     os.makedirs(cfg.paths.output_dir, exist_ok=True)
     cli_args = config_to_evaluate_args(cfg)
     _python("src/evaluate.py", cli_args, str(cfg.gpu.evaluate_gpu))
