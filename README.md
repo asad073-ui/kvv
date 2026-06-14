@@ -75,6 +75,36 @@ print(open(sorted(glob.glob('/content/turborag_quant/analysis/report.txt'))[-1])
 
 ---
 
+## ⚙️ Full 3-Dataset Paper Run (RTX 3090)
+
+The Colab MVE above is a HotpotQA-only smoke pass. To run the **full paper**
+(NQ-Open + HotpotQA + RGB × C0–C3 × K∈{1,3,5}) use the dedicated profile and the
+new CLI surface — **no source edits required**. See [RUN_3090.md](RUN_3090.md)
+for VRAM/disk/runtime estimates.
+
+```bash
+export SCRATCH_DIR=/mnt/nvme/turborag_quant   # fast local NVMe (I/O bound)
+export HF_HOME=/mnt/nvme/hf_cache
+
+# Paper run: combined corpus = HotpotQA paragraphs + RGB docs + 10k DPR wiki passages
+python src/run_experiment.py --config configs/full_experiment.yaml \
+    --wiki_pages 10000 \
+    --num_nq_examples 200 --num_hotpot_examples 200 --num_rgb_examples 200 \
+    --k_values 1 3 5 --conditions C0 C1 C2 C3
+```
+
+New CLI flags on `run_experiment.py` (all override the YAML):
+`--wiki_pages`, `--num_nq_examples`, `--num_hotpot_examples`, `--num_rgb_examples`,
+`--k_values`, `--conditions`. The resolved run config (incl. `wiki_pages`) is saved
+to `results/config.json`, echoed into every results row, and the combined stdout
+is teed to `results/logs_<ts>.txt`. The `tables` stage writes
+`analysis/paper_table.{csv,md,tex}`.
+
+> **Disk, not VRAM, is the constraint.** All three precisions cost ≈64.7 KB/token;
+> 10k wiki pages ≈ 92 GB of KV cache. Size your scratch disk first (RUN_3090.md).
+
+---
+
 ## Project Structure
 
 ```

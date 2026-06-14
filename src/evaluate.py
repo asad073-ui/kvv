@@ -291,8 +291,13 @@ def generate_with_cache(
     past_kvcache: Optional[DynamicCache],
     query: str,
     chunks: List[str],
-) -> str:
+) -> Tuple[str, Optional[float]]:
     """Generate an answer given either a stitched KV cache (C1-C3) or raw chunks (C0).
+
+    Returns (answer, ttft_seconds) where ttft_seconds is the wall-clock time to the
+    FIRST generated token (the real time-to-first-token).  For the C0 path, which
+    delegates to model.generate(), per-token timing is not exposed, so ttft is
+    returned as None and the caller falls back to total latency.
 
     The cached path uses a manual greedy-decode loop instead of model.generate().
     transformers 4.51.3's generate() recomputes cache_position as
@@ -325,8 +330,10 @@ def generate_with_cache(
             cur_ids   = suffix_ids
             total_len = cached_len            # tokens already in the cache
             generated: List[int] = []
+            ttft_seconds: Optional[float] = None
+            _t0 = time.perf_counter()
 
-            for _ in range(MAX_NEW_TOKENS):
+            for step in range(MAX_NEW_TOKENS):
                 q_len          = cur_ids.shape[1]
                 position_ids   = torch.arange(
                     total_len, total_len + q_len, device=device
@@ -345,6 +352,10 @@ def generate_with_cache(
                     cache_position=cache_position,
                     use_cache=True,
                 )
+                if step == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    ttft_seconds = time.perf_counter() - _t0
                 next_id = int(out.logits[0, -1].argmax())
                 past      = out.past_key_values
                 total_len += q_len
@@ -353,7 +364,7 @@ def generate_with_cache(
                 generated.append(next_id)
                 cur_ids = torch.tensor([[next_id]], device=device, dtype=suffix_ids.dtype)
 
-            return tokenizer.decode(generated, skip_special_tokens=True).strip()
+            return tokenizer.decode(generated, skip_special_tokens=True).strip(), ttft_seconds
 
         else:
             prompt    = build_full_prompt(chunks, query)
@@ -367,7 +378,9 @@ def generate_with_cache(
                 eos_token_id=EOS_TOKEN_IDS,
             )
             new_tokens = outputs[0][input_ids.shape[1]:]
-            return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+            # model.generate does not expose first-token timing → ttft is None and
+            # the caller uses total latency for C0.
+            return tokenizer.decode(new_tokens, skip_special_tokens=True).strip(), None
 
 
 
@@ -448,8 +461,9 @@ def run_query(
 
         io_time = 0.0
         ttft_start = time.perf_counter()
-        answer = generate_with_cache(model, tokenizer, device, None, query, chunk_texts)
-        ttft = time.perf_counter() - ttft_start
+        answer, ttft_first = generate_with_cache(model, tokenizer, device, None, query, chunk_texts)
+        total_latency = time.perf_counter() - ttft_start
+        ttft = ttft_first if ttft_first is not None else total_latency
 
     else:
         kvcache_list = [prefix_kvcache]
@@ -488,16 +502,18 @@ def run_query(
         io_time = time.perf_counter() - io_start
 
         ttft_start = time.perf_counter()
-        answer = generate_with_cache(model, tokenizer, device, stitched, query, [])
-        ttft = time.perf_counter() - ttft_start
+        answer, ttft_first = generate_with_cache(model, tokenizer, device, stitched, query, [])
+        total_latency = time.perf_counter() - ttft_start
+        ttft = ttft_first if ttft_first is not None else total_latency
 
     return {
-        "answer":        answer,
-        "context":       "\n\n".join(chunk_texts),
-        "chunk_texts":   chunk_texts,           # per-chunk list for per-chunk faithfulness scoring
-        "ttft_seconds":  ttft,
-        "io_seconds":    io_time,
-        "kv_size_bytes": kv_size_bytes,
+        "answer":          answer,
+        "context":         "\n\n".join(chunk_texts),
+        "chunk_texts":     chunk_texts,         # per-chunk list for per-chunk faithfulness scoring
+        "ttft_seconds":    ttft,                # time to FIRST generated token
+        "latency_seconds": total_latency,       # total generation latency
+        "io_seconds":      io_time,
+        "kv_size_bytes":   kv_size_bytes,
     }
 
 
@@ -553,7 +569,7 @@ def _load_from_hf(
 
 def _load_from_jsonl(query_file: str, num_examples: int) -> List[Dict]:
     examples = []
-    with open(query_file) as f:
+    with open(query_file, encoding="utf-8") as f:
         for line in f:
             data   = json.loads(line.strip())
             query  = data.get("query") or data.get("question", "")
@@ -623,6 +639,7 @@ def _get_pip_freeze() -> List[str]:
 
 
 def main():
+    global MAX_NEW_TOKENS
     parser = argparse.ArgumentParser(description="TurboRAG KV-cache quantization evaluation")
     parser.add_argument("--model_name",            type=str, required=True)
     parser.add_argument("--embedding_model_name",  type=str, default="BAAI/bge-small-en-v1.5")
@@ -646,7 +663,22 @@ def main():
     parser.add_argument("--eval_hhem",        action="store_true")
     parser.add_argument("--eval_nli",         action="store_true")
     parser.add_argument("--similarity_top_k", type=int, default=10)
+    # ── Full-run provenance + throughput knobs ────────────────────────────────
+    parser.add_argument("--wiki_pages", type=int, default=0,
+                        help="DPR Wikipedia passages in the corpus (recorded for provenance)")
+    parser.add_argument("--faithfulness_mode", type=str, default="per_chunk_max",
+                        choices=["per_chunk_max", "full_context"],
+                        help="per_chunk_max: max faithfulness across retrieved chunks "
+                             "(lenient; avoids K-dependent truncation). "
+                             "full_context: score the answer against the concatenated "
+                             "context the model actually attended over (paper-faithful).")
+    parser.add_argument("--hhem_batch_size", type=int, default=16)
+    parser.add_argument("--nli_batch_size",  type=int, default=16)
+    parser.add_argument("--max_new_tokens",  type=int, default=MAX_NEW_TOKENS)
     args = parser.parse_args()
+
+    # Apply configurable generation length globally (declared at top of main()).
+    MAX_NEW_TOKENS = args.max_new_tokens
 
     # Task 14: guard against the dead use_flash_attn lever
     if getattr(args, "use_flash_attn", False):
@@ -782,6 +814,7 @@ def main():
                             "context":     result["context"],
                             "chunk_texts": result["chunk_texts"],
                             "ttft":        result["ttft_seconds"],
+                            "latency":     result["latency_seconds"],
                             "io_seconds":  result["io_seconds"],
                             "kv_bytes":    result["kv_size_bytes"],
                             "is_refusal":  is_refusal,
@@ -791,11 +824,13 @@ def main():
                             "dataset":    ds_name,
                             "k":          k,
                             "condition":  condition,
+                            "wiki_pages": args.wiki_pages,
                             "query":      query,
                             "gold":       answer,   # serializes fine as JSON list
                             "prediction": result["answer"],
                             "context":    result["context"],
                             "ttft":       result["ttft_seconds"],
+                            "latency":    result["latency_seconds"],
                             "io_seconds": result["io_seconds"],
                             "kv_bytes":   result["kv_size_bytes"],
                             "is_refusal": is_refusal,
@@ -851,13 +886,15 @@ def main():
                             refs[ii],
                         )
 
-                ttft_list = [per_ex[i]["ttft"]      for i in valid_idx]
+                ttft_list = [per_ex[i]["ttft"]       for i in valid_idx]
+                lat_list  = [per_ex[i]["latency"]    for i in valid_idx]
                 io_list   = [per_ex[i]["io_seconds"] for i in valid_idx]
                 kv_list   = [per_ex[i]["kv_bytes"]   for i in valid_idx]
 
-                avg_ttft = sum(ttft_list) / len(ttft_list) if ttft_list else float("nan")
-                avg_io   = sum(io_list)   / len(io_list)   if io_list   else float("nan")
-                avg_kv   = sum(kv_list)   / len(kv_list)   if kv_list   else 0
+                avg_ttft    = sum(ttft_list) / len(ttft_list) if ttft_list else float("nan")
+                avg_latency = sum(lat_list)  / len(lat_list)  if lat_list  else float("nan")
+                avg_io      = sum(io_list)   / len(io_list)   if io_list   else float("nan")
+                avg_kv      = sum(kv_list)   / len(kv_list)   if kv_list   else 0
 
                 is_refusals  = [per_ex[i]["is_refusal"] for i in valid_idx]
                 refusal_rate = sum(is_refusals) / max(len(is_refusals), 1)
@@ -878,14 +915,26 @@ def main():
                 n_total     = len(nr_idx)
                 HHEM_THRESHOLD = 0.5
 
-                # Task 8: per-chunk scoring — avoids K-dependent truncation artifact
+                # Faithfulness scoring.
+                #   per_chunk_max: max faithfulness across retrieved chunks
+                #                  (lenient; avoids K-dependent truncation artifact).
+                #   full_context : score against the concatenated context the model
+                #                  actually attended over (paper-faithful; HHEM/NLI
+                #                  truncate to their own token windows).
                 if hhem_scorer and nr_idx:
-                    chunk_texts_list = [per_ex[i]["chunk_texts"] for i in nr_idx]
-                    nr_preds         = [per_ex[i]["answer"]      for i in nr_idx]
-                    faith_scores, hallucinated_flags = hallucination_rate_per_chunk(
-                        hhem_scorer, chunk_texts_list, nr_preds,
-                        threshold=HHEM_THRESHOLD,
-                    )
+                    nr_preds = [per_ex[i]["answer"] for i in nr_idx]
+                    if args.faithfulness_mode == "full_context":
+                        ctxs = [trim_context_for_hhem(per_ex[i]["context"]) for i in nr_idx]
+                        faith_scores = hhem_scorer.batch_score(
+                            ctxs, nr_preds, batch_size=args.hhem_batch_size)
+                        hallucinated_flags = [s < HHEM_THRESHOLD for s in faith_scores]
+                    else:
+                        chunk_texts_list = [per_ex[i]["chunk_texts"] for i in nr_idx]
+                        faith_scores, hallucinated_flags = hallucination_rate_per_chunk(
+                            hhem_scorer, chunk_texts_list, nr_preds,
+                            batch_size=args.hhem_batch_size,
+                            threshold=HHEM_THRESHOLD,
+                        )
                     hall_rate = sum(hallucinated_flags) / len(hallucinated_flags)
                     n_total   = len(hallucinated_flags)
                     n_hall    = sum(hallucinated_flags)
@@ -896,9 +945,17 @@ def main():
                             all_records[rec_idx]["hhem_hallucinated"] = hallucinated_flags[j]
 
                 if nli_scorer and nr_idx:
-                    chunk_texts_list = [per_ex[i]["chunk_texts"] for i in nr_idx]
-                    nr_preds         = [per_ex[i]["answer"]      for i in nr_idx]
-                    nli_scores = entailment_per_chunk(nli_scorer, chunk_texts_list, nr_preds)
+                    nr_preds = [per_ex[i]["answer"] for i in nr_idx]
+                    if args.faithfulness_mode == "full_context":
+                        ctxs = [trim_context_for_hhem(per_ex[i]["context"], max_tokens=200)
+                                for i in nr_idx]
+                        nli_scores = nli_scorer.batch_score(
+                            ctxs, nr_preds, batch_size=args.nli_batch_size)
+                    else:
+                        chunk_texts_list = [per_ex[i]["chunk_texts"] for i in nr_idx]
+                        nli_scores = entailment_per_chunk(
+                            nli_scorer, chunk_texts_list, nr_preds,
+                            batch_size=args.nli_batch_size)
                     ent_score  = sum(e for e, _, _ in nli_scores) / len(nli_scores) \
                                  if nli_scores else float("nan")
                     for j, i in enumerate(nr_idx):
@@ -913,6 +970,7 @@ def main():
                     "k":                  k,
                     "condition":          condition,
                     "condition_label":    CONDITION_LABELS[condition],
+                    "wiki_pages":         args.wiki_pages,
                     "n_examples":         len(preds),
                     "n_hall":             n_hall,
                     "n_total":            n_total,
@@ -924,6 +982,7 @@ def main():
                     "hallucination_rate": round(hall_rate, 4) if not math.isnan(hall_rate) else "N/A",
                     "entailment_score":   round(ent_score,  4) if not math.isnan(ent_score)  else "N/A",
                     "avg_ttft_s":         round(avg_ttft, 4) if not math.isnan(avg_ttft) else "N/A",
+                    "avg_latency_s":      round(avg_latency, 4) if not math.isnan(avg_latency) else "N/A",
                     "avg_io_s":           round(avg_io,   4) if not math.isnan(avg_io)   else "N/A",
                     "avg_kv_bytes":       int(avg_kv),
                 }
@@ -947,11 +1006,11 @@ def main():
 
     # ── Write summary CSV ────────────────────────────────────────────────────
     fieldnames = [
-        "dataset", "k", "condition", "condition_label", "n_examples",
+        "dataset", "k", "condition", "condition_label", "wiki_pages", "n_examples",
         "n_hall", "n_total", "paired_n", "refusal_rate",
         "EM", "contain_EM", "F1",
         "hallucination_rate", "entailment_score",
-        "avg_ttft_s", "avg_io_s", "avg_kv_bytes",
+        "avg_ttft_s", "avg_latency_s", "avg_io_s", "avg_kv_bytes",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
@@ -989,12 +1048,12 @@ def main():
 
     # ── Print table ──────────────────────────────────────────────────────────
     headers = ["Dataset", "K", "Cond", "n", "Paired", "Refuse",
-               "EM", "ContEM", "F1", "Hall↓", "Ent↑", "TTFT(s)", "IO(s)", "KV(MB)"]
+               "EM", "ContEM", "F1", "Hall↓", "Ent↑", "TTFT(s)", "Lat(s)", "IO(s)", "KV(MB)"]
     table = [
         [r["dataset"], r["k"], r["condition"], r["n_examples"], r["paired_n"],
          r["refusal_rate"], r["EM"], r["contain_EM"], r["F1"],
          r["hallucination_rate"], r["entailment_score"],
-         r["avg_ttft_s"], r["avg_io_s"], round(r["avg_kv_bytes"] / 1e6, 2)]
+         r["avg_ttft_s"], r["avg_latency_s"], r["avg_io_s"], round(r["avg_kv_bytes"] / 1e6, 2)]
         for r in summary_rows
     ]
     print("\n" + tabulate(table, headers=headers, tablefmt="grid"))

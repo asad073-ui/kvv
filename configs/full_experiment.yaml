@@ -1,0 +1,102 @@
+
+model:
+  name: "Qwen/Qwen2.5-3B-Instruct"   # ← set to your TurboRAG checkpoint if different
+  use_flash_attn: false              # raw-key storage requires eager attention
+  dtype: "float16"                   # stored caches are float16; keep model fp16 to match
+
+embedding:
+  name: "BAAI/bge-small-en-v1.5"
+
+chunking:
+  chunk_size:    512
+  chunk_overlap: 10
+
+#  Document corpus 
+# num_docs > 0 enables the DPR Wikipedia stream (NQ-Open coverage). It is COMBINED
+# with the HotpotQA paragraphs and RGB documents into one global retrieval index.
+# WARNING: storage scales with this number — see RUN_3090.md (≈8.8 GB per 1000
+# wiki pages for all three precisions). Start at 10000; raise once disk is sized.
+wiki_docs:
+  download_url: "https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz"
+  num_docs:     10000
+  save_dir:     "${SCRATCH_DIR}/wiki_dpr_docs"
+
+paths:
+  kvcache_dir:  "${SCRATCH_DIR}/chunk_kvcache"   # keep on local NVMe — I/O bound
+  storage_dir:  "${SCRATCH_DIR}/doc_emb"
+  output_dir:   "${SCRATCH_DIR}/results"
+  analysis_dir: "${SCRATCH_DIR}/analysis"
+
+retrieval:
+  similarity_top_k: 10               # must be >= max(k_values)
+
+conditions: [C0, C1, C2, C3]
+k_values:   [1, 3, 5]
+
+datasets:
+  nq_open:
+    hf_name:        "nq_open"
+    hf_config:      null
+    hf_split:       "validation"
+    question_field: "question"
+    answer_field:   "answer"
+    num_examples:   200
+    description:    "Single-hop open-domain QA (H1 in a controlled setting)"
+
+  hotpotqa:
+    hf_name:        "hotpotqa/hotpot_qa"
+    hf_config:      "distractor"
+    hf_split:       "validation"
+    question_field: "question"
+    answer_field:   "answer"
+    num_examples:   200
+    use_provided_context: true
+    description:    "Multi-hop QA (main benchmark for H2)"
+
+  rgb:
+    hf_name:        null
+    hf_config:      null
+    hf_split:       null
+    question_field: "question"
+    answer_field:   "answer"
+    query_file:     "questions/rgb.jsonl"   # ships positive + negative docs
+    num_examples:   200
+    description:    "RAG robustness under noisy retrieval (H1, H3)"
+
+# MVE disabled for the full paper run.
+mve:
+  enabled:      false
+  num_examples: 200
+  datasets:     ["nq_open", "hotpotqa", "rgb"]
+  k_values:     [1, 3, 5]
+
+generation:
+  max_new_tokens: 64
+  do_sample:      false
+  temperature:    null
+
+# Faithfulness evaluation 
+
+# faithfulness_mode:
+#   per_chunk_max – max faithfulness across retrieved chunks (lenient; avoids the
+#                   K-dependent truncation artifact, but can MASK H2 amplification).
+#   full_context  – score the answer against the concatenated context the model
+#                   actually attended over (paper-faithful for H2; HHEM/NLI handle
+#                   their own truncation). Recommended to run BOTH and report.
+evaluation:
+  eval_hhem: true
+  eval_nli:  true
+  hhem_model: "vectara/hallucination_evaluation_model"
+  nli_model:  "cross-encoder/nli-deberta-v3-large"
+  hallucination_threshold: 0.5
+  faithfulness_mode: "per_chunk_max"
+  hhem_batch_size: 16
+  nli_batch_size:  16
+
+calibration:
+  n_examples: 50
+  condition:  "C1"
+
+gpu:
+  chunk_cache_gpu: 0
+  evaluate_gpu:    0                 # single RTX 3090

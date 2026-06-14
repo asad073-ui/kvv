@@ -69,7 +69,7 @@ def _to_ns(obj: Any) -> Any:
 # Public API
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_config(path: str | None = None) -> SimpleNamespace:
+def load_config(path: str | None = None, apply_mve: bool = True) -> SimpleNamespace:
     """
     Load and return the experiment config as a SimpleNamespace tree.
 
@@ -78,20 +78,25 @@ def load_config(path: str | None = None) -> SimpleNamespace:
     path : str, optional
         Path to the YAML file.  Defaults to configs/experiment.yaml
         relative to the project root (two levels up from this file).
+    apply_mve : bool
+        When True (default) and mve.enabled is set, the MVE block is flattened
+        onto the active dataset list / k_values / per-dataset num_examples.
+        Pass False to obtain the raw YAML values untouched (used by the full-
+        experiment CLI path so leftover MVE counts never leak into a full run).
     """
     if path is None:
         here    = os.path.dirname(os.path.abspath(__file__))
         project = os.path.dirname(here)          # src/ → project root
         path    = os.path.join(project, "configs", "experiment.yaml")
 
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
     expanded = _expand(raw)
     cfg      = _to_ns(expanded)
 
     # ── Convenience: flatten MVE overrides if mve.enabled ────────────────────
-    if getattr(getattr(cfg, "mve", None), "enabled", False):
+    if apply_mve and getattr(getattr(cfg, "mve", None), "enabled", False):
         mve = cfg.mve
         cfg.datasets_list    = mve.datasets
         cfg.k_values         = mve.k_values
@@ -160,15 +165,56 @@ def config_to_evaluate_args(cfg: SimpleNamespace) -> list[str]:
     if cfg.model.use_flash_attn:
         args.append("--use_flash_attn")
 
+    # Record the wiki corpus size in every results/summary row for provenance.
+    wd = getattr(cfg, "wiki_docs", None)
+    n_wiki = int(getattr(wd, "num_docs", 0) or 0) if wd is not None else 0
+    args += ["--wiki_pages", str(n_wiki)]
+
+    # Faithfulness scoring mode + scorer batch sizes (full-run throughput knobs).
+    ev = getattr(cfg, "evaluation", None)
+    args += ["--faithfulness_mode", getattr(ev, "faithfulness_mode", "per_chunk_max")]
+    args += ["--hhem_batch_size",   str(getattr(ev, "hhem_batch_size", 16))]
+    args += ["--nli_batch_size",    str(getattr(ev, "nli_batch_size", 16))]
+
+    # Generation length (paper uses a fixed short budget across all conditions).
+    gen = getattr(cfg, "generation", None)
+    args += ["--max_new_tokens", str(getattr(gen, "max_new_tokens", 64))]
+
     return args
+
+
+# Default DPR Wikipedia passages URL (Facebook CDN).  Used when wiki_docs.num_docs
+# > 0 but no explicit download_url is set in the YAML.
+DEFAULT_DPR_TSV_URL = "https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz"
+
+
+def precisions_for_conditions(conditions: list[str]) -> list[str]:
+    """Map experimental conditions to the KV-cache precisions that must be built.
+
+    C0 (Gold Oracle) needs no precomputed cache; C1→fp16, C2→int8, C3→int4.
+    Building only the required precisions saves large amounts of disk.
+    If only C0 is requested we still emit fp16 (argparse requires >=1 precision
+    and it keeps the index usable if a quant condition is added later).
+    """
+    cond_to_prec = {"C1": "fp16", "C2": "int8", "C3": "int4"}
+    precs = [cond_to_prec[c] for c in conditions if c in cond_to_prec]
+    # Preserve canonical order fp16 < int8 < int4, dedup.
+    ordered = [p for p in ("fp16", "int8", "int4") if p in precs]
+    return ordered or ["fp16"]
 
 
 def config_to_chunk_cache_args(cfg: SimpleNamespace) -> list[str]:
     """
     Convert the loaded config into CLI arguments for chunk_cache.py.
-    Uses the DPR TSV direct download via cfg.wiki_docs when available.
+
+    The corpus is now built from the UNION of every source that the active
+    datasets require:
+      * HotpotQA paragraphs   – when 'hotpotqa' is an active dataset
+      * RGB positives/negatives – when 'rgb' is an active dataset (local JSONL)
+      * DPR Wikipedia passages – when wiki_docs.num_docs > 0 (NQ-Open coverage)
     """
-    wd = getattr(cfg, "wiki_docs", None)
+    active = set(getattr(cfg, "datasets_list", list(cfg.datasets.__dict__.keys())))
+
     args = [
         "--model_name",           cfg.model.name,
         "--embedding_model_name", cfg.embedding.name,
@@ -178,32 +224,46 @@ def config_to_chunk_cache_args(cfg: SimpleNamespace) -> list[str]:
         "--chunk_overlap",        str(cfg.chunking.chunk_overlap),
     ]
 
-    # Decide the corpus source.  When wiki_docs is disabled (no download_url or
-    # num_docs == 0), build the retrieval corpus from HotpotQA's own context
-    # paragraphs so retrieval recall > 0 and the model can answer the questions.
-    use_hq_corpus = (
-        wd is None
-        or not getattr(wd, "download_url", "")
-        or getattr(wd, "num_docs", 0) == 0
-    )
+    # Only build the precisions the active conditions actually need.
+    args += ["--precisions"] + precisions_for_conditions(list(cfg.conditions))
 
-    if use_hq_corpus:
-        # Number of HotpotQA questions to harvest paragraphs from.
-        mve = getattr(cfg, "mve", None)
-        if getattr(mve, "enabled", False):
-            n_ex = getattr(mve, "num_examples", 100)
-        else:
-            # Drive corpus size from the hotpotqa dataset config.
-            # If hotpotqa is in datasets_list use its num_examples; otherwise fall back to 200.
-            hq_entry = getattr(cfg.datasets, "hotpotqa", None)
-            n_ex = getattr(hq_entry, "num_examples", 200) if hq_entry is not None else 200
-        args += ["--hotpotqa_corpus", "--hotpotqa_num_examples", str(n_ex)]
-    else:
+    mve = getattr(cfg, "mve", None)
+    mve_on = bool(getattr(mve, "enabled", False))
+
+    def _ds_num(name, fallback=200):
+        entry = getattr(cfg.datasets, name, None)
+        if entry is None:
+            return fallback
+        if mve_on:
+            return getattr(mve, "num_examples", fallback)
+        return getattr(entry, "num_examples", fallback)
+
+    # ── HotpotQA paragraphs ──────────────────────────────────────────────────
+    if "hotpotqa" in active:
+        args += ["--hotpotqa_corpus",
+                 "--hotpotqa_num_examples", str(_ds_num("hotpotqa"))]
+
+    # ── RGB positives + negatives (local JSONL) ──────────────────────────────
+    if "rgb" in active:
+        rgb_entry = getattr(cfg.datasets, "rgb", None)
+        rgb_file  = getattr(rgb_entry, "query_file", "") if rgb_entry else ""
+        if rgb_file:
+            args += ["--rgb_corpus", rgb_file,
+                     "--rgb_num_examples", str(_ds_num("rgb"))]
+
+    # ── DPR Wikipedia passages (drives NQ-Open coverage) ─────────────────────
+    wd = getattr(cfg, "wiki_docs", None)
+    n_wiki = int(getattr(wd, "num_docs", 0) or 0) if wd is not None else 0
+    if n_wiki > 0:
+        url = getattr(wd, "download_url", "") or DEFAULT_DPR_TSV_URL
+        save_dir = getattr(wd, "save_dir", "") or os.path.join(
+            os.path.dirname(cfg.paths.kvcache_dir), "wiki_dpr_docs")
         args += [
-            "--wiki_docs_url",      wd.download_url,
-            "--wiki_docs_num",      str(getattr(wd, "num_docs", 10000)),
-            "--wiki_docs_save_dir", wd.save_dir,
+            "--wiki_docs_url",      url,
+            "--wiki_docs_num",      str(n_wiki),
+            "--wiki_docs_save_dir", save_dir,
         ]
+
     return args
 
 

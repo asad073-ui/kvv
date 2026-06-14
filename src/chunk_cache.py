@@ -56,9 +56,9 @@ PRECISIONS = ("fp16", "int8", "int4")
 DPR_TSV_URL = "https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 # CLI
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 
 def get_args():
     parser = argparse.ArgumentParser(
@@ -77,15 +77,30 @@ def get_args():
                         help="Directory to cache wiki_passages.jsonl. "
                              "Defaults to --output_path/../wiki_dpr_docs")
 
-    # HotpotQA corpus (recommended for the Colab MVE; replaces DPR Wikipedia)
+    # HotpotQA corpus (multi-hop paragraphs).  Can be combined with wiki + rgb.
     parser.add_argument("--hotpotqa_corpus", action="store_true", default=False,
-                        help="Build corpus from HotpotQA context paragraphs instead of DPR Wikipedia")
+                        help="Add HotpotQA context paragraphs to the corpus")
     parser.add_argument("--hotpotqa_num_examples", type=int, default=100,
                         help="Number of HotpotQA examples to extract paragraphs from")
+
+    # RGB corpus (noisy-retrieval positives + negatives from a local JSONL).
+    parser.add_argument("--rgb_corpus", type=str, default="",
+                        help="Path to rgb.jsonl; ingests each question's positive + "
+                             "negative documents so RGB retrieval recall > 0")
+    parser.add_argument("--rgb_num_examples", type=int, default=0,
+                        help="Number of RGB examples to harvest documents from")
 
     # Local document fallback (used when --wiki_docs_url is empty string)
     parser.add_argument("--documents_dir",    type=str, default=None,
                         help="Local directory of .txt files (fallback if wiki_docs_url is empty)")
+
+    # Which precision caches to build.  Subset of {fp16,int8,int4}.  Building only
+    # the precisions required by the active conditions saves large amounts of disk
+    # (each precision is a separate .pt file per chunk).
+    parser.add_argument("--precisions", type=str, nargs="+",
+                        default=list(PRECISIONS),
+                        choices=list(PRECISIONS),
+                        help="Precision caches to write per chunk (default: all three)")
 
     # KV-cache and index paths
     parser.add_argument("--output_path",   type=str, default="chunk_kvcache")
@@ -95,9 +110,9 @@ def get_args():
     return parser.parse_args()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 # Document loading: DPR Wikipedia TSV (direct download, no HF datasets needed)
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 
 def load_wiki_dpr_documents(
     download_url: str,
@@ -123,7 +138,7 @@ def load_wiki_dpr_documents(
     if os.path.exists(cache_file):
         print(f"[chunk_cache] Loading cached passages from {cache_file}")
         docs = []
-        with open(cache_file) as f:
+        with open(cache_file, encoding="utf-8") as f:
             for line in f:
                 row = json.loads(line)
                 docs.append(Document(
@@ -143,7 +158,7 @@ def load_wiki_dpr_documents(
     try:
         with urllib.request.urlopen(download_url) as resp, \
              gzip.open(resp, "rt", encoding="utf-8") as gz, \
-             open(tmp_file, "w") as fout:
+             open(tmp_file, "w", encoding="utf-8") as fout:
 
             reader = csv.reader(gz, delimiter="\t")
             next(reader)  # skip header row: id  text  title
@@ -175,9 +190,9 @@ def load_wiki_dpr_documents(
     return docs
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 # Local document fallback (original documents/ directory loader)
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 
 def load_local_documents(documents_dir: str) -> List[Document]:
     from llama_index.core import SimpleDirectoryReader
@@ -187,9 +202,9 @@ def load_local_documents(documents_dir: str) -> List[Document]:
     return docs
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 # HotpotQA corpus loader (replaces the DPR Wikipedia download for the MVE)
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 
 def load_hotpotqa_corpus(hf_dataset, num_examples: int = 100) -> List[Document]:
     """
@@ -229,9 +244,58 @@ def load_hotpotqa_corpus(hf_dataset, num_examples: int = 100) -> List[Document]:
     return docs
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -
+# RGB corpus loader (noisy-retrieval positives + negatives from local JSONL)
+# -
+
+def load_rgb_corpus(rgb_jsonl: str, num_examples: int = 0) -> List[Document]:
+    """
+    Ingest the positive (supporting) and negative (distractor) documents that the
+    RGB benchmark ships per question into the retrieval corpus.
+
+    rgb.jsonl row schema:
+        {"id", "query", "answer", "positive": [str,...], "negative": [str,...]}
+
+    Both lists are added so that (a) the answer-bearing positives are retrievable
+    and (b) the negatives create the realistic noisy-retrieval setting RGB is
+    designed to probe.  num_examples<=0 means "use every row in the file".
+    """
+    import io
+    seen = set()
+    docs: List[Document] = []
+    n_pos = n_neg = 0
+    with io.open(rgb_jsonl, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    if num_examples and num_examples > 0:
+        rows = rows[:num_examples]
+    for row in rows:
+        qid = row.get("id", len(docs))
+        for kind in ("positive", "negative"):
+            for passage in row.get(kind, []) or []:
+                text = (passage or "").strip()
+                if not text:
+                    continue
+                key = text[:120]
+                if key in seen:
+                    continue
+                seen.add(key)
+                docs.append(Document(
+                    text=text,
+                    metadata={"title": f"rgb_{qid}_{kind}", "source": "rgb", "rgb_kind": kind},
+                    id_=f"rgb_{len(docs)}",
+                ))
+                if kind == "positive":
+                    n_pos += 1
+                else:
+                    n_neg += 1
+    print(f"[chunk_cache] Built RGB corpus: {len(docs)} docs "
+          f"({n_pos} positive, {n_neg} negative) from {len(rows)} questions")
+    return docs
+
+
+# -
 # Helper: normalise DynamicCache.to_legacy_cache() output
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 
 def _to_per_layer_pairs(legacy_cache):
     """
@@ -270,9 +334,9 @@ def _to_per_layer_pairs(legacy_cache):
     return list(legacy_cache)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 # Core: compute + save per-chunk KV caches
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 
 def compute_and_save_chunk(
     chunk_text: str,
@@ -281,8 +345,9 @@ def compute_and_save_chunk(
     tokenizer,
     output_path: str,
     device: torch.device,
+    precisions: List[str] = PRECISIONS,
 ) -> dict:
-    """Forward-pass a single chunk and save FP16/INT8/INT4 compressed caches."""
+    """Forward-pass a single chunk and save the requested compressed caches."""
     wrapped = f"<|doc_start|>{chunk_text}<|doc_end|>"
     inputs  = tokenizer(wrapped, return_tensors="pt").to(device)
 
@@ -301,7 +366,7 @@ def compute_and_save_chunk(
     legacy_cache = _to_per_layer_pairs(raw_legacy)
 
     paths = {}
-    for prec in PRECISIONS:
+    for prec in precisions:
         compressed = compress_kvcache(legacy_cache, prec)
         fpath      = os.path.join(output_path, f"kvcache_chunk_{chunk_id}_{prec}.pt")
         torch.save(compressed, fpath)
@@ -310,9 +375,9 @@ def compute_and_save_chunk(
     return paths
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 # LlamaIndex node parser that wraps our cache builder
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 
 class KVCachedNodeParser:
     """
@@ -323,11 +388,13 @@ class KVCachedNodeParser:
     base so arbitrary attributes can be set freely.
     """
 
-    def __init__(self, model, tokenizer, output_path, device, chunk_size=512, chunk_overlap=10):
+    def __init__(self, model, tokenizer, output_path, device, chunk_size=512,
+                 chunk_overlap=10, precisions=PRECISIONS):
         self.model        = model
         self.tokenizer    = tokenizer
         self.output_path  = output_path
         self.device       = device
+        self.precisions   = list(precisions)
         self.splitter     = TokenTextSplitter(
             tokenizer=tokenizer.encode,
             chunk_size=chunk_size,
@@ -349,17 +416,19 @@ class KVCachedNodeParser:
                 chunk_id = f"{doc_id}_{global_chunk_id}"
                 paths    = compute_and_save_chunk(
                     chunk_text, chunk_id, self.model,
-                    self.tokenizer, self.output_path, self.device
+                    self.tokenizer, self.output_path, self.device,
+                    precisions=self.precisions,
                 )
+                meta = {
+                    "raw_text": chunk_text,
+                    "source":   document.metadata.get("source", "unknown"),
+                }
+                for prec in self.precisions:
+                    meta[f"kvcache_{prec}"] = paths[prec]
                 node = TextNode(
                     text=f"<|doc_start|>{chunk_text}<|doc_end|>",
                     id_=f"chunk_{chunk_id}",
-                    metadata={
-                        "kvcache_fp16": paths["fp16"],
-                        "kvcache_int8": paths["int8"],
-                        "kvcache_int4": paths["int4"],
-                        "raw_text":     chunk_text,
-                    },
+                    metadata=meta,
                 )
                 nodes.append(node)
                 global_chunk_id += 1
@@ -367,9 +436,9 @@ class KVCachedNodeParser:
         return nodes
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Main
-# ──────────────────────────────────────────────────────────────────────────────
+# -
 
 def main():
     args   = get_args()
@@ -399,31 +468,56 @@ def main():
     os.makedirs(args.output_path, exist_ok=True)
     os.makedirs(args.storage_dir,  exist_ok=True)
 
-    # ── Load documents ────────────────────────────────────────────────────────
-    # Order matters: HotpotQA corpus is the recommended Colab MVE path and is
-    # checked first so it wins even if --wiki_docs_url is also supplied.
+    # - Load documents -
+    # Sources are now ADDITIVE: a single global retrieval corpus is built from
+    # the union of every enabled source.  This is what makes the full 3-dataset
+    # experiment possible — HotpotQA paragraphs give multi-hop recall, RGB docs
+    # give noisy-retrieval recall, and the DPR wiki passages give NQ-Open
+    # coverage (scaled by --wiki_docs_num / --wiki_pages).
+    documents: List[Document] = []
+    corpus_manifest = {}
+
     if args.hotpotqa_corpus:
         try:
             from datasets import load_dataset
             hq_ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split="validation")
         except Exception as e:
             raise RuntimeError(f"Failed to load HotpotQA for corpus building: {e}") from e
-        documents = load_hotpotqa_corpus(hq_ds, num_examples=args.hotpotqa_num_examples)
-    elif args.wiki_docs_url:
+        hq_docs = load_hotpotqa_corpus(hq_ds, num_examples=args.hotpotqa_num_examples)
+        documents += hq_docs
+        corpus_manifest["hotpotqa_docs"] = len(hq_docs)
+        corpus_manifest["hotpotqa_num_examples"] = args.hotpotqa_num_examples
+
+    if args.rgb_corpus:
+        rgb_docs = load_rgb_corpus(args.rgb_corpus, num_examples=args.rgb_num_examples)
+        documents += rgb_docs
+        corpus_manifest["rgb_docs"] = len(rgb_docs)
+        corpus_manifest["rgb_num_examples"] = args.rgb_num_examples
+
+    if args.wiki_docs_url and args.wiki_docs_num > 0:
         save_dir = args.wiki_docs_save_dir or os.path.join(
             os.path.dirname(args.output_path), "wiki_dpr_docs"
         )
-        documents = load_wiki_dpr_documents(
+        wiki_docs = load_wiki_dpr_documents(
             download_url=args.wiki_docs_url,
             num_docs=args.wiki_docs_num,
             save_dir=save_dir,
         )
-    elif args.documents_dir:
-        documents = load_local_documents(args.documents_dir)
-    else:
+        documents += wiki_docs
+        corpus_manifest["wiki_pages"] = len(wiki_docs)
+
+    if args.documents_dir:
+        local_docs = load_local_documents(args.documents_dir)
+        documents += local_docs
+        corpus_manifest["local_docs"] = len(local_docs)
+
+    if not documents:
         raise ValueError(
-            "Provide --hotpotqa_corpus, --wiki_docs_url (DPR TSV), or --documents_dir"
+            "No corpus source produced documents. Provide at least one of "
+            "--hotpotqa_corpus, --rgb_corpus, --wiki_docs_url (DPR TSV) or --documents_dir."
         )
+    print(f"[chunk_cache] Combined corpus: {len(documents)} documents "
+          f"from sources {corpus_manifest}")
 
     # ── Load model + tokenizer ────────────────────────────────────────────────
     print(f"[chunk_cache] Loading model: {args.model_name}")
@@ -447,10 +541,12 @@ def main():
         device=device,
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
+        precisions=args.precisions,
     )
 
     nodes = node_parser.get_nodes_from_documents(documents)
-    print(f"[chunk_cache] Built {len(nodes)} chunk nodes")
+    print(f"[chunk_cache] Built {len(nodes)} chunk nodes "
+          f"(precisions={args.precisions})")
 
     vector_store = SimpleVectorStore()
     index        = VectorStoreIndex(
@@ -460,6 +556,21 @@ def main():
     )
     index.storage_context.persist(persist_dir=args.storage_dir)
     print(f"[chunk_cache] Index persisted to: {args.storage_dir}")
+
+    # Record corpus composition + build settings next to the index so the
+    # evaluation/analysis stages (and the paper) can report exactly what corpus
+    # the KV caches were built from.
+    corpus_manifest.update({
+        "num_chunks":     len(nodes),
+        "precisions":     list(args.precisions),
+        "chunk_size":     args.chunk_size,
+        "chunk_overlap":  args.chunk_overlap,
+        "embedding_model": args.embedding_model_name,
+    })
+    manifest_path = os.path.join(args.storage_dir, "corpus_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(corpus_manifest, f, indent=2)
+    print(f"[chunk_cache] Corpus manifest → {manifest_path}")
 
 
 if __name__ == "__main__":
