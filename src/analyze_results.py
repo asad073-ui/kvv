@@ -1,34 +1,5 @@
-"""
-analyze_results.py  –  Hypothesis testing and figure generation.
-
-Reads the summary JSON produced by evaluate.py and runs:
-  H1 – Asymmetric Degradation: does hallucination drop faster than F1?
-  H2 – Multi-Chunk Amplification: does the INT4–FP16 gap grow super-linearly with K?
-  H3 – Task-Complexity: is the effect largest on RGB, then HotpotQA, then NQ-Open?
-  Efficiency: tabulate KV storage size and TTFT by precision.
-
-Outputs
-───────
-  analysis/h1_degradation.csv
-  analysis/h2_amplification.csv
-  analysis/h3_complexity.csv
-  analysis/efficiency.csv
-  analysis/figure1_data.csv     – relative F1 vs faithfulness drop by precision
-  analysis/figure2_data.csv     – INT4−FP16 hallucination gap vs K
-  analysis/figure3_data.csv     – storage size vs hallucination rate
-  analysis/report.txt           – human-readable summary
-
-Usage
-─────
-python src/analyze_results.py \
-    --summary_json results/summary_<timestamp>.json \
-    --output_dir analysis
-"""
-
 import os, sys, json, csv, argparse, math, random
-# proportions_ztest lives in statsmodels, NOT scipy.  Importing it from scipy
-# silently fails (scipy.stats has no such attribute) and disables every H3
-# significance test.  statsmodels is pinned in requirements.txt.
+
 try:
     from statsmodels.stats.proportion import proportions_ztest
 except ImportError:
@@ -114,9 +85,9 @@ def write_csv(path, fieldnames, rows):
         w.writerows(rows)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Bootstrap helpers for H2 confidence intervals (Task 11)
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def bootstrap_ci_delta(delta_values: List[float], n_boot: int = 1000,
                        ci: float = 0.95, seed: int = 42) -> Tuple[float, float]:
@@ -167,11 +138,11 @@ def main():
 
     report_lines = ["=" * 70, "TurboRAG KV Quantization – Hypothesis Analysis", "=" * 70, ""]
 
-    # ──────────────────────────────────────────────────────────────────────────
+   
     # H1: Asymmetric Degradation (FP16 → INT8 → INT4)
     # Both metrics expressed as absolute percentage-point changes so the
     # comparison faith_delta_pp > f1_delta_pp is dimensionally consistent.
-    # ──────────────────────────────────────────────────────────────────────────
+    
     h1_rows = []
     report_lines.append("H1 – Asymmetric Degradation (absolute pp change from FP16 baseline)")
     report_lines.append("-" * 70)
@@ -222,10 +193,10 @@ def main():
     # Minimum gap threshold to avoid noise-level false positives (used by H2 and H3).
     MIN_GAP = 0.02
 
-    # ──────────────────────────────────────────────────────────────────────────
+    
     # H2: Multi-Chunk Amplification  δK = Hall(INT4,K) − Hall(FP16,K)
     # Bootstrap CIs are added for statistical defensibility at small n.
-    # ──────────────────────────────────────────────────────────────────────────
+    
     h2_rows = []
     report_lines.append("H2 – Multi-Chunk Amplification (INT4−FP16 hallucination gap vs K)")
     report_lines.append("-" * 70)
@@ -282,9 +253,9 @@ def main():
     )
     report_lines.append("")
 
-    # ──────────────────────────────────────────────────────────────────────────
+   
     # H3: Task-Complexity  (NQ-Open < HotpotQA < RGB)
-    # ──────────────────────────────────────────────────────────────────────────
+   
     h3_rows = []
 
     report_lines.append("H3 – Task Complexity (expected: NQ-Open < HotpotQA < RGB)")
@@ -439,9 +410,9 @@ def main():
 
     report_lines.append("")
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # -
     # Efficiency (Stage 11)
-    # ──────────────────────────────────────────────────────────────────────────
+    # -
     eff_rows = []
     report_lines.append("Efficiency – KV storage size and TTFT by condition")
     report_lines.append("-" * 70)
@@ -466,9 +437,9 @@ def main():
         eff_rows
     )
 
-    # ──────────────────────────────────────────────────────────────────────────
+   
     # Figure CSVs
-    # ──────────────────────────────────────────────────────────────────────────
+    
 
     # Figure 1: F1 drop vs faithfulness drop by precision (averaged over all ds+k)
     # Faithfulness expressed as absolute pp change (avoids near-zero denominator

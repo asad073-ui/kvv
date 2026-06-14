@@ -1,28 +1,3 @@
-"""
-make_paper_tables.py  –  Publication-ready table generation (Stage 8 of the prompt).
-
-Reads the summary JSON produced by evaluate.py and emits the exact main result
-table from the research idea (Final Benchmark Table Design):
-
-    Dataset | K | Condition | EM | F1 | Hallucination↓ | Entailment↑ | KV Size↓ | TTFT↓ | Latency↓
-
-Outputs
-───────
-  analysis/paper_table.csv   – machine-readable master table (one row per ds×K×cond)
-  analysis/paper_table.md    – the same table as GitHub-flavoured markdown
-  analysis/paper_table.tex   – a LaTeX booktabs version for the paper
-
-The figure CSVs (figure1/2/3_data.csv) are produced by analyze_results.py; this
-script consumes the same summary JSON so the two are always consistent.
-
-Usage
-─────
-python src/make_paper_tables.py \
-    --summary_json results/summary_<ts>.json \
-    --output_dir   analysis \
-    [--config_json results/config.json]
-"""
-
 from __future__ import annotations
 import os, sys, json, csv, argparse
 

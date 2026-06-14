@@ -1,28 +1,3 @@
-"""
-config.py  –  YAML configuration loader for the TurboRAG quantization study.
-
-Reads configs/experiment.yaml (or a user-specified path), expands
-${USER} / ${SCRATCH_DIR} / ${HF_HOME} shell-style variables,
-and returns a clean namespace object that every script can consume.
-
-Usage inside Python
-───────────────────
-    from config import load_config
-    cfg = load_config()               # reads configs/experiment.yaml by default
-    cfg = load_config("configs/experiment.yaml")
-
-    # Access fields
-    print(cfg.model.name)
-    print(cfg.paths.kvcache_dir)
-    print(cfg.k_values)              # [1, 3, 5]
-    print(cfg.datasets["hotpotqa"]["query_file"])
-
-Usage from CLI (print resolved config)
-───────────────────────────────────────
-    python src/config.py
-    python src/config.py configs/experiment.yaml
-"""
-
 from __future__ import annotations
 import os
 import re
@@ -32,9 +7,9 @@ from types import SimpleNamespace
 from typing import Any
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Env-var expansion
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 _ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
@@ -53,9 +28,9 @@ def _expand(value: Any) -> Any:
     return value
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Dict → SimpleNamespace (recursive)
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def _to_ns(obj: Any) -> Any:
     if isinstance(obj, dict):
@@ -65,9 +40,9 @@ def _to_ns(obj: Any) -> Any:
     return obj
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Public API
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def load_config(path: str | None = None, apply_mve: bool = True) -> SimpleNamespace:
     """
@@ -95,7 +70,7 @@ def load_config(path: str | None = None, apply_mve: bool = True) -> SimpleNamesp
     expanded = _expand(raw)
     cfg      = _to_ns(expanded)
 
-    # ── Convenience: flatten MVE overrides if mve.enabled ────────────────────
+    #  Convenience: flatten MVE overrides if mve.enabled 
     if apply_mve and getattr(getattr(cfg, "mve", None), "enabled", False):
         mve = cfg.mve
         cfg.datasets_list    = mve.datasets
@@ -238,12 +213,12 @@ def config_to_chunk_cache_args(cfg: SimpleNamespace) -> list[str]:
             return getattr(mve, "num_examples", fallback)
         return getattr(entry, "num_examples", fallback)
 
-    # ── HotpotQA paragraphs ──────────────────────────────────────────────────
+    #  HotpotQA paragraphs 
     if "hotpotqa" in active:
         args += ["--hotpotqa_corpus",
                  "--hotpotqa_num_examples", str(_ds_num("hotpotqa"))]
 
-    # ── RGB positives + negatives (local JSONL) ──────────────────────────────
+    # RGB positives + negatives (local JSONL) 
     if "rgb" in active:
         rgb_entry = getattr(cfg.datasets, "rgb", None)
         rgb_file  = getattr(rgb_entry, "query_file", "") if rgb_entry else ""
@@ -251,7 +226,7 @@ def config_to_chunk_cache_args(cfg: SimpleNamespace) -> list[str]:
             args += ["--rgb_corpus", rgb_file,
                      "--rgb_num_examples", str(_ds_num("rgb"))]
 
-    # ── DPR Wikipedia passages (drives NQ-Open coverage) ─────────────────────
+    #  DPR Wikipedia passages (drives NQ-Open coverage) 
     wd = getattr(cfg, "wiki_docs", None)
     n_wiki = int(getattr(wd, "num_docs", 0) or 0) if wd is not None else 0
     if n_wiki > 0:
@@ -267,9 +242,9 @@ def config_to_chunk_cache_args(cfg: SimpleNamespace) -> list[str]:
     return args
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # CLI: print resolved config
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 if __name__ == "__main__":
     import pprint

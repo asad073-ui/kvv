@@ -1,34 +1,3 @@
-"""
-qwen2.py — Modified Qwen2 attention for TurboRAG-style KV-cache stitching.
-
-Target: transformers==4.51.3 (pinned in requirements.txt).
-
-Design ("always store raw / always rotate full")
-────────────────────────────────────────────────
-Keys are stored WITHOUT RoPE in the DynamicCache.  On every forward step (chunk
-build, prefix build, and decode), RoPE is applied to the *full* retrieved key
-sequence using global position IDs [0, 1, ..., total_kv_len-1] on a LOCAL
-variable that is used for attention but is NEVER written back to the cache.  The
-cache therefore always holds raw keys.
-
-Why this makes independently-built chunk caches composable: if every chunk cache
-holds raw keys, then concatenating N chunk caches and rotating the stitched
-sequence with positions [0..total-1] gives exactly the same keys as if the whole
-concatenated document had been encoded in a single pass.  Queries are rotated with
-their own (global) positions supplied by the model via `position_embeddings`, so
-query↔key relative positions are always correct.
-
-This follows the TurboRAG "reordered positions" approach (Lu et al., EMNLP 2025).
-
-API notes for 4.51.3 (verified against the installed source):
-  * Qwen2DecoderLayer calls self_attn(..., past_key_value=<singular>, ...) and
-    unpacks a 2-tuple  ->  forward returns (attn_output, attn_weights).
-  * DynamicCache.update(key, value, layer_idx, cache_kwargs) stores the tensors
-    and returns the concatenated (all_keys, all_values).
-  * Qwen2Attention.__init__ on 4.51.3 does NOT set num_heads / num_key_value_heads
-    / hidden_size, so we set them here.
-"""
-
 from typing import Optional, Tuple
 
 import torch
@@ -52,27 +21,14 @@ def apply_single_rotary_pos_emb(
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
 ) -> torch.Tensor:
-    """Apply RoPE to a single tensor (query or key).
-
-    cos/sin shape: [batch, seq_len, head_dim] — already index-selected for the
-    relevant position ids.  unsqueeze_dim=1 inserts the head axis.
-    """
+    
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     return (t * cos) + (rotate_half(t) * sin)
 
 
 class Qwen2ModifiedAttention(Qwen2Attention):
-    """
-    Drop-in replacement for Qwen2Attention (transformers==4.51.3) that stores raw
-    (un-rotated) keys in the DynamicCache and applies RoPE to the full key
-    sequence with global position ids at every forward step.
-
-    # NOTE: FlashAttention-2 is intentionally NOT supported here.
-    # Raw (un-rotated) key storage requires the full attention weight matrix
-    # to apply global-position RoPE at inference time. FA2's fused kernel
-    # does not expose intermediate key states. attn_implementation must be "eager".
-    """
+    
 
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -107,13 +63,9 @@ class Qwen2ModifiedAttention(Qwen2Attention):
 
         cos, sin = position_embeddings
 
-        # ── Queries: RoPE with the model-supplied (global) position embeddings ──
         query_states = apply_single_rotary_pos_emb(query_states, cos, sin)
 
-        # ── Keys/values: store RAW, then rotate the FULL sequence locally ──────
-        # cache.update() stores raw key_states and returns ALL cached keys
-        # (previous + current), still un-rotated.  We rotate that whole sequence
-        # with global ids [0..total-1] into a LOCAL variable only.
+        
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(
@@ -127,11 +79,11 @@ class Qwen2ModifiedAttention(Qwen2Attention):
         cos_k, sin_k = self.rotary_emb_full(hidden_states, full_position_ids)
         key_states = apply_single_rotary_pos_emb(key_states, cos_k, sin_k)
 
-        # ── GQA expansion ──────────────────────────────────────────────────────
+        # GQA expansion 
         key_states_exp   = repeat_kv(key_states,   self.num_key_value_groups)
         value_states_exp = repeat_kv(value_states, self.num_key_value_groups)
 
-        # ── Eager scaled dot-product attention ────────────────────────────────
+        #  Eager scaled dot-product attention 
         attn_weights = torch.matmul(query_states, key_states_exp.transpose(2, 3)) * self.scaling
 
         if attention_mask is not None:

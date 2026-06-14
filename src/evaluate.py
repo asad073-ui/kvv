@@ -1,33 +1,3 @@
-"""
-evaluate.py  –  Main evaluation script for the TurboRAG KV-cache quantization study.
-
-Implements all experimental conditions:
-  C0  Gold Oracle RAG   – full raw-text context, no precomputed cache
-  C1  FP16 TurboRAG    – precomputed FP16 chunk caches stitched at query time
-  C2  INT8 TurboRAG    – offline INT8 quantized chunk caches
-  C3  INT4 TurboRAG    – offline INT4 quantized chunk caches
-
-Design (transformers==4.51.3)
-─────────────────────────────────────────────────────────────────────
-  * Chunk + prefix KV caches store RAW (un-rotated) keys.  At decode time the
-    modified attention in qwen2.py re-applies RoPE to the full stitched key
-    sequence with global positions, so independently-built caches compose.
-  * Cache handling uses ONLY the stable DynamicCache.to_legacy_cache() /
-    from_legacy_cache() round-trip — never key_cache / value_cache / _seen_tokens.
-  * The cached path (C1-C3) generates with a manual greedy-decode loop, because
-    4.51.3's generate() recomputes cache_position as arange(input_len)[past_len:],
-    which is empty when the pre-filled cache is longer than the suffix.
-  * Everything runs in float16 (T4 / sm_75 has no native bfloat16).
-  * Refusals ("I can not answer …") are tracked separately and PAIRED across
-    conditions before faithfulness scoring, so hallucination_rate denominators
-    are consistent and H1/H2 comparisons are valid.
-  * NQ-Open multi-answer: gold answers are kept as a list; EM/F1/contain_EM use
-    max-over-golds scoring.
-  * Faithfulness is scored per-chunk (max across chunks) to avoid the K-dependent
-    truncation artifact that would otherwise inflate hallucination at high K.
-"""
-
-
 import os
 import sys
 import json
@@ -78,9 +48,9 @@ log = logging.getLogger(__name__)
 GLOBAL_SEED = 42
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Prompt construction
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 
 SYSTEM_PROMPT = (
@@ -108,9 +78,9 @@ def build_query_suffix(query: str) -> str:
 
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # KV cache stitching
-# ──────────────────────────────────────────────────────────────────────────────
+
 # transformers==4.51.3: use the stable to_legacy_cache() / from_legacy_cache()
 # round-trip.  We never touch cache.key_cache / cache.value_cache / _seen_tokens
 # (deprecated / removed in later releases).
@@ -146,9 +116,9 @@ def stack_past_key_values(caches: List[DynamicCache]) -> DynamicCache:
 
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Context helpers
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 
 def trim_context_for_hhem(context: str, max_tokens: int = 400) -> str:
@@ -161,16 +131,7 @@ def trim_context_for_hhem(context: str, max_tokens: int = 400) -> str:
     return context[: max_tokens * 4]
 
 
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Accuracy helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-# FIX-NORMDUP: _normalize_answer is now imported from metrics.py as
-# _normalize_answer (aliased from _normalize) to avoid duplicate
-# implementations that could silently diverge.
-
 
 
 def _extract_short_answer(text: str) -> str:
@@ -264,20 +225,15 @@ def batch_contain_em(predictions: List[str], gold_lists: List[List[str]]) -> flo
 
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Generation
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 EOS_TOKEN_IDS  = [151645, 151643]
 MAX_NEW_TOKENS = 64
 
-# The system prompt instructs the model to emit this exact phrase when the
-# retrieved documents do not contain the answer.  A refusal is a RETRIEVAL
-# failure, not a faithfulness failure, so it is tracked separately and excluded
-# from HHEM/NLI scoring (otherwise it inflates every hallucination_rate).
-REFUSAL_MARKER = "I can not answer the question"
 
+REFUSAL_MARKER = "I can not answer the question"
 
 
 def _get_cache_seq_len(cache: DynamicCache) -> int:
@@ -292,20 +248,7 @@ def generate_with_cache(
     query: str,
     chunks: List[str],
 ) -> Tuple[str, Optional[float]]:
-    """Generate an answer given either a stitched KV cache (C1-C3) or raw chunks (C0).
 
-    Returns (answer, ttft_seconds) where ttft_seconds is the wall-clock time to the
-    FIRST generated token (the real time-to-first-token).  For the C0 path, which
-    delegates to model.generate(), per-token timing is not exposed, so ttft is
-    returned as None and the caller falls back to total latency.
-
-    The cached path uses a manual greedy-decode loop instead of model.generate().
-    transformers 4.51.3's generate() recomputes cache_position as
-    arange(input_len)[past_len:] (see GenerationMixin._get_initial_cache_position),
-    which is EMPTY when the pre-filled cache is longer than the new suffix — our
-    exact situation.  Driving position_ids / cache_position / attention_mask by
-    hand sidesteps that entirely.
-    """
     with torch.no_grad():
         if past_kvcache is not None:
             cached_len     = _get_cache_seq_len(past_kvcache)
@@ -384,9 +327,9 @@ def generate_with_cache(
 
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Per-query inference for each condition
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 
 PRECISION_MAP = {"C0": None, "C1": "fp16", "C2": "int8", "C3": "int4"}
@@ -400,15 +343,7 @@ CONDITION_LABELS = {
 
 
 def _move_compressed_to_device(compressed: list, device: torch.device) -> list:
-    """Move compressed KV cache tensors to `device` before dequantization.
-
-    For FP16: moves the raw float16 tensors.
-    For INT8: moves quantized (uint8), scale (fp32), zero_point (int32).
-    For INT4: moves packed (uint8) and scale (fp32).
-    Operates on the list-of-dicts structure from compress_kvcache().
-    Running dequantization on GPU (bit-unpacking, scale multiply) is faster and
-    avoids a large transient on-GPU memory spike from loading already-inflated tensors.
-    """
+    
     moved = []
     for layer_data in compressed:
         new_layer = {}
@@ -438,15 +373,7 @@ def run_query(
     device,
     prefix_kvcache: DynamicCache,
 ) -> Dict[str, Any]:
-    """
-    Run a single query under a given condition.
-
-    Returns io_seconds (disk load + dequant) and ttft_seconds (first model forward
-    to first token) separately so callers can attribute latency correctly.
-
-    prefix_kvcache is shared (read-only) across all queries.  stack_past_key_values
-    materialises brand-new tensors via torch.cat, so the prefix is never mutated.
-    """
+    
     nodes_k       = retrieved_nodes[:k]
     precision     = PRECISION_MAP[condition]
     chunk_texts   = []
@@ -517,9 +444,9 @@ def run_query(
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Dataset loaders
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 
 def _load_from_hf(
@@ -609,9 +536,9 @@ def load_dataset_examples(
     raise ValueError(f"Dataset '{dataset_name}': provide either --hf_names or --query_files")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Metadata capture helpers (Task 12)
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 
 def _get_git_commit() -> str:
@@ -633,9 +560,9 @@ def _get_pip_freeze() -> List[str]:
         return []
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Main evaluation loop
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 
 def main():
@@ -727,7 +654,6 @@ def main():
     attn_impl = "eager"  # use_flash_attn is guarded above; always eager here
     log.info(f"Loading model: {args.model_name} (attn={attn_impl})")
 
-    # T4 (sm_75): float16 throughout, never bfloat16.
     model = Qwen2ModifiedForCausalLM.from_pretrained(
         args.model_name,
         attn_implementation=attn_impl,
@@ -771,7 +697,7 @@ def main():
     all_records  = []
     summary_rows = []
 
-    # ── Outer loop: datasets ──────────────────────────────────────────────────
+    #  Outer loop: datasets 
     for ds_name, qfile, hf_name, hf_cfg, hf_split, q_field, a_field, n_examples in zip(
         args.datasets, query_files, hf_names, hf_configs,
         hf_splits, question_fields, answer_fields, num_examples_list,
@@ -786,10 +712,7 @@ def main():
         n_ex = len(examples)
 
         for k in args.k_values:
-            # ── Pass 1: collect per-condition per-example results ──────────────
-            # all_cond_results[condition][i] is either a dict of results or None
-            # (if the example raised an exception).  Keeping the per-example
-            # structure lets us compute the refusal intersection mask in Pass 2.
+           
             all_cond_results: Dict[str, List[Optional[Dict]]] = {}
             cond_ex_to_rec:   Dict[str, Dict[int, int]]       = {}  # condition->ex_idx->rec_idx
 
@@ -845,12 +768,7 @@ def main():
                 all_cond_results[condition] = per_ex
                 cond_ex_to_rec[condition]   = ex_to_rec
 
-            # ── Task 7: paired non-refusal mask (intersection across C1/C2/C3 only) ──
-            # C0 is the oracle upper-bound — its refusal pattern is driven by raw-text
-            # retrieval, not by quantization noise, so including it in the pairing
-            # requirement would incorrectly shrink the faithfulness denominator for H1/H2.
-            # The paired mask covers only the quantization conditions (C1/C2/C3).
-            # C0 is scored separately on its own non-refusal set in Pass 2.
+           
             quant_conditions = [c for c in args.conditions if c != "C0"]
             paired_mask = [
                 all(
@@ -862,7 +780,7 @@ def main():
             paired_n = sum(paired_mask)
             nr_paired_idx = [i for i in range(n_ex) if paired_mask[i]]
 
-            # ── Pass 2: compute metrics per condition ──────────────────────────
+            #  Pass 2: compute metrics per condition 
             for condition in args.conditions:
                 per_ex    = all_cond_results[condition]
                 ex_to_rec = cond_ex_to_rec[condition]
@@ -899,11 +817,7 @@ def main():
                 is_refusals  = [per_ex[i]["is_refusal"] for i in valid_idx]
                 refusal_rate = sum(is_refusals) / max(len(is_refusals), 1)
 
-                # Faithfulness set selection:
-                # C0 uses its own non-refusal examples (oracle has independent refusals).
-                # C1/C2/C3 use the paired set (intersection of non-refusals across all
-                # quant conditions) so hallucination_rate denominators are consistent
-                # and H1/H2 δ comparisons are valid.
+                
                 if condition == "C0":
                     nr_idx = [i for i in valid_idx if not per_ex[i]["is_refusal"]]
                 else:
@@ -915,12 +829,7 @@ def main():
                 n_total     = len(nr_idx)
                 HHEM_THRESHOLD = 0.5
 
-                # Faithfulness scoring.
-                #   per_chunk_max: max faithfulness across retrieved chunks
-                #                  (lenient; avoids K-dependent truncation artifact).
-                #   full_context : score against the concatenated context the model
-                #                  actually attended over (paper-faithful; HHEM/NLI
-                #                  truncate to their own token windows).
+               
                 if hhem_scorer and nr_idx:
                     nr_preds = [per_ex[i]["answer"] for i in nr_idx]
                     if args.faithfulness_mode == "full_context":
@@ -998,13 +907,13 @@ def main():
                     f"KV={avg_kv/1e6:.2f}MB"
                 )
 
-    # ── Write raw JSONL ──────────────────────────────────────────────────────
+    #  Write raw JSONL 
     with open(raw_path, "w") as f:
         for rec in all_records:
             f.write(json.dumps(rec) + "\n")
     log.info(f"Raw records → {raw_path}")
 
-    # ── Write summary CSV ────────────────────────────────────────────────────
+    #  Write summary CSV 
     fieldnames = [
         "dataset", "k", "condition", "condition_label", "wiki_pages", "n_examples",
         "n_hall", "n_total", "paired_n", "refusal_rate",
@@ -1022,12 +931,12 @@ def main():
         writer.writerows(summary_rows)
     log.info(f"Summary CSV → {csv_path}")
 
-    # ── Write summary JSON ───────────────────────────────────────────────────
+    #  Write summary JSON 
     with open(json_path, "w") as f:
         json.dump(summary_rows, f, indent=2)
     log.info(f"Summary JSON → {json_path}")
 
-    # ── Task 12: Write experiment metadata ───────────────────────────────────
+    #  Task 12: Write experiment metadata 
     meta = {
         "git_commit":             _get_git_commit(),
         "python_version":         sys.version,
@@ -1046,7 +955,7 @@ def main():
         json.dump(meta, f, indent=2)
     log.info(f"Experiment metadata → {meta_path}")
 
-    # ── Print table ──────────────────────────────────────────────────────────
+    #  Print table 
     headers = ["Dataset", "K", "Cond", "n", "Paired", "Refuse",
                "EM", "ContEM", "F1", "Hall↓", "Ent↑", "TTFT(s)", "Lat(s)", "IO(s)", "KV(MB)"]
     table = [

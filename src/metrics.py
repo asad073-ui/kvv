@@ -1,15 +1,3 @@
-"""
-metrics.py  –  Evaluation metrics for the TurboRAG quantization study.
-
-Implements:
-  - Exact Match  (EM)
-  - Token-level F1
-  - HHEM-2.1-Open hallucination scoring  (primary faithfulness signal)
-  - DeBERTa-large-v3-NLI entailment scoring  (secondary validation signal)
-
-All metrics follow the methodology described in the refined research idea
-(Stages 6, 7, and 8).
-"""
 
 from __future__ import annotations
 import re
@@ -20,9 +8,9 @@ from typing import List, Optional, Tuple
 import torch
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Text normalisation (shared by EM + F1)
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def _normalize(text: str) -> str:
     """Lower-case, strip punctuation and articles, collapse whitespace."""
@@ -32,9 +20,9 @@ def _normalize(text: str) -> str:
     return " ".join(text.split())
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Exact Match
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def exact_match(prediction: str, ground_truth: str) -> int:
     return int(_normalize(prediction) == _normalize(ground_truth))
@@ -47,9 +35,9 @@ def batch_em(predictions: List[str], ground_truths: List[str]) -> float:
     return sum(exact_match(p, g) for p, g in zip(predictions, ground_truths)) / len(predictions)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Token-level F1
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def token_f1(prediction: str, ground_truth: str) -> float:
     pred_tokens  = _normalize(prediction).split()
@@ -73,9 +61,9 @@ def batch_f1(predictions: List[str], ground_truths: List[str]) -> float:
     return sum(token_f1(p, g) for p, g in zip(predictions, ground_truths)) / len(predictions)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # HHEM-2.1-Open hallucination scorer
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 class HHEMScorer:
     """
@@ -121,9 +109,9 @@ class HHEMScorer:
         return results
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # DeBERTa-v3-large NLI scorer
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 class DeBERTaNLIScorer:
     """
@@ -198,9 +186,9 @@ class DeBERTaNLIScorer:
         return results
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Aggregation helpers
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def hallucination_rate(faithfulness_scores: List[float], threshold: float = 0.5) -> float:
     """Fraction of samples where faithfulness < threshold (= hallucinated)."""
@@ -223,17 +211,7 @@ def hallucination_rate_per_chunk(
     batch_size: int = 8,
     threshold: float = 0.5,
 ) -> Tuple[List[float], List[bool]]:
-    """Score faithfulness per-chunk and return max faithfulness score per example.
-
-    Scores each (chunk, answer) pair independently and takes the max faithfulness
-    across chunks. Semantically: "is the answer faithful to ANY retrieved chunk?"
-    This avoids the K-dependent truncation artifact where the evidence chunk is
-    cut off when context is concatenated before trimming.
-
-    Returns:
-        faith_scores: List[float] — max faithfulness across chunks, per example
-        hallucinated: List[bool]  — True if max_faith < threshold
-    """
+    
     faith_scores = []
     for chunks, answer in zip(chunk_texts_list, answers):
         if not chunks:

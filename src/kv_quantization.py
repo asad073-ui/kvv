@@ -1,40 +1,15 @@
-"""
-kv_quantization.py  –  Offline KV-cache quantization utilities for TurboRAG.
-
-Supports three precision levels:
-  FP16  – no quantization; stored as bfloat16 / float16 tensors.
-  INT8  – per-token asymmetric quantization over the head-dim axis.
-          Stores: quantized_tensor (int8), scale (fp32), zero_point (int32).
-  INT4  – per-token symmetric max-abs quantization over the head-dim axis.
-          Two INT4 values are packed into one uint8 byte.
-          Stores: packed_tensor (uint8), scale (fp32).
-
-Design note
-───────────
-Quantization happens OFFLINE (at chunk-cache build time) and BEFORE storage.
-At query time the cache is dequantized back to FP32/BF16 before stitching.
-This isolates the effect of offline stored-cache compression, as described in
-the refined research idea (Stage 2 of the methodology pipeline).
-"""
 
 from __future__ import annotations
 import torch
 from typing import Tuple, Dict, Any, List
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Low-level quantisation helpers
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def quantize_int8(tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """
-    Per-token asymmetric INT8 quantization along the last dimension (head_dim).
-
-    tensor shape: [num_layers * 2, batch, num_heads, seq_len, head_dim]
-    We quantize over head_dim independently for every (layer, batch, head, token).
-
-    Returns dict with keys: 'quantized', 'scale', 'zero_point', 'shape', 'dtype'
-    """
+    
     orig_dtype = tensor.dtype
     t = tensor.float()  # work in fp32
 
@@ -134,9 +109,9 @@ def _str_to_dtype(s: str) -> torch.dtype:
     return mapping.get(s, torch.float32)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Layer-cache-level API  (operates on a legacy KV-cache tuple for one chunk)
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def compress_kvcache(legacy_cache: tuple, precision: str) -> Any:
     """
@@ -177,9 +152,7 @@ def decompress_kvcache(compressed: list, precision: str) -> tuple:
     legacy = []
     for layer_data in compressed:
         if precision == "fp16":
-            # T4 path: keep everything float16.  (INT8/INT4 dequantize already
-            # restore the stored original dtype, which is float16 because the
-            # chunk caches are built with a float16 model.)
+            
             k = layer_data["k"].to(torch.float16)
             v = layer_data["v"].to(torch.float16)
         elif precision == "int8":
@@ -194,9 +167,9 @@ def decompress_kvcache(compressed: list, precision: str) -> tuple:
     return tuple(legacy)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Storage size utility
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def cache_size_bytes(compressed: list, precision: str) -> int:
     """Return total byte size of a compressed KV cache list."""

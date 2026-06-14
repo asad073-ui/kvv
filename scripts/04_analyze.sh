@@ -1,29 +1,18 @@
-#!/usr/bin/env bash
-# scripts/04_analyze.sh
-# ─────────────────────────────────────────────────────────────────────────────
-# Stages 9–11 — Hypothesis Analysis + Figure CSVs (CPU-only)
-# ─────────────────────────────────────────────────────────────────────────────
-# Output directory is read from paths.analysis_dir in configs/experiment.yaml.
-# The script auto-selects the most recent summary_*.json in results/.
-#
-# Usage
-# ─────
-#   bash scripts/04_analyze.sh
-# ─────────────────────────────────────────────────────────────────────────────
+
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-# ── System paths ───────────────────────────────────────────────────────────────
-# Colab: USER is unset and /scratch is not writable; default to /content.
+#  System paths 
 export SCRATCH_DIR="${SCRATCH_DIR:-/content/turborag_quant}"
 export HF_HOME="${HF_HOME:-/content/hf_cache}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 
-# ── Virtual environment ────────────────────────────────────────────────────────
+#  Virtual environment 
 if [[ -f "/home/${USER}/venvs/crisp/bin/activate" ]]; then
     source "/home/${USER}/venvs/crisp/bin/activate"
 elif [[ -n "${VIRTUAL_ENV:-}" ]]; then

@@ -1,33 +1,3 @@
-"""
-run_experiment.py  –  Config-driven experiment runner.
-
-This is the single Python entry point that reads configs/experiment.yaml
-and runs whichever stages you specify.  It calls chunk_cache.py and
-evaluate.py as sub-processes so each stage gets a clean GPU context.
-
-Stages
-──────
-  build   – Stage 1+2: build offline chunk KV caches (FP16/INT8/INT4)
-  eval    – Stage 3–7: evaluate all conditions × K × datasets
-  calib   – Stage 8:   metric calibration (HHEM vs DeBERTa-NLI)
-  analyze – Stages 9–11: hypothesis analysis + figure CSVs
-  all     – run all four stages in order
-
-Usage
-─────
-    # Print the resolved config (no stages run)
-    python src/run_experiment.py --config configs/experiment.yaml --dry_run
-
-    # Run everything end-to-end
-    python src/run_experiment.py --stages all
-
-    # Run only the evaluation stage (caches already built)
-    python src/run_experiment.py --stages eval
-
-    # MVE: override num_examples and datasets
-    python src/run_experiment.py --stages all --mve
-"""
-
 from __future__ import annotations
 import argparse
 import glob
@@ -37,7 +7,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-# ── locate project root ────────────────────────────────────────────────────────
+#  locate project root 
 HERE    = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
@@ -87,12 +57,12 @@ def _python(script_rel: str, extra_args: list[str], gpu_id: str, env: dict | Non
     _run([sys.executable, script] + extra_args, env=gpu_env)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Stage runners
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 def stage_build(cfg, args):
-    print("\n━━━ Stage: Build Chunk KV Caches ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("\n Stage: Build Chunk KV Caches ")
     os.makedirs(cfg.paths.kvcache_dir, exist_ok=True)
     os.makedirs(cfg.paths.storage_dir,  exist_ok=True)
     wiki_docs = getattr(cfg, "wiki_docs", None)
@@ -103,7 +73,7 @@ def stage_build(cfg, args):
 
 
 def stage_eval(cfg, args):
-    print("\n━━━ Stage: Evaluate All Conditions ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("\n Stage: Evaluate All Conditions ")
     # Seed the orchestration process for reproducibility; evaluate.py seeds itself.
     import random as _random
     import numpy as _np
@@ -123,7 +93,7 @@ def stage_eval(cfg, args):
 
 
 def stage_calib(cfg, args):
-    print("\n━━━ Stage: Metric Calibration ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("\n Stage: Metric Calibration ")
     results_files = sorted(glob.glob(os.path.join(PROJECT, cfg.paths.output_dir, "results_*.jsonl")))
     if not results_files:
         print("[calib] No results JSONL found – skipping calibration.")
@@ -141,7 +111,7 @@ def stage_calib(cfg, args):
 
 
 def stage_analyze(cfg, args):
-    print("\n━━━ Stage: Hypothesis Analysis ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("\n Stage: Hypothesis Analysis ")
     summary_files = sorted(glob.glob(os.path.join(PROJECT, cfg.paths.output_dir, "summary_*.json")))
     if not summary_files:
         print("[analyze] No summary JSON found – skipping analysis.")
@@ -156,7 +126,7 @@ def stage_analyze(cfg, args):
 
 
 def stage_tables(cfg, args):
-    print("\n━━━ Stage: Publication Tables ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("\n Stage: Publication Tables ")
     out_dir = os.path.join(PROJECT, cfg.paths.output_dir)
     summary_files = sorted(glob.glob(os.path.join(out_dir, "summary_*.json")))
     if not summary_files:
@@ -175,9 +145,9 @@ def stage_tables(cfg, args):
     _python("src/make_paper_tables.py", cli_args, gpu_id="0")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # Main
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 STAGE_FNS = {
     "build":   stage_build,
@@ -208,7 +178,7 @@ def main():
     parser.add_argument("--eval_gpu",   type=int, default=None,
                         help="Override gpu.evaluate_gpu from YAML")
 
-    # ── Full-experiment CLI surface (no source edits required) ────────────────
+    #  Full-experiment CLI surface (no source edits required) 
     parser.add_argument("--wiki_pages", type=int, default=None,
                         help="DPR Wikipedia passages to ingest (drives NQ-Open coverage). "
                              "0 disables the wiki source.")
@@ -247,9 +217,6 @@ def main():
             if ds_entry is not None:
                 ds_entry.num_examples = mve.num_examples
 
-    # ── Full-experiment overrides: any explicit count/condition/K/wiki flag
-    #    switches OFF MVE mode and rebuilds the active dataset list from the
-    #    per-dataset example counts (a count of 0 drops that dataset). ─────────
     full_flags = [args.wiki_pages, args.num_nq_examples, args.num_hotpot_examples,
                   args.num_rgb_examples, args.k_values, args.conditions]
     if any(f is not None for f in full_flags):
@@ -287,11 +254,11 @@ def main():
 
     if args.dry_run:
         import pprint
-        print("── Resolved config ──────────────────────────────────")
+        print(" Resolved config ")
         pprint.pprint(vars(cfg), width=100)
-        print("\n── chunk_cache.py args ──────────────────────────────")
+        print("\n chunk_cache.py args ")
         print(" ".join(config_to_chunk_cache_args(cfg)))
-        print("\n── evaluate.py args ─────────────────────────────────")
+        print("\n evaluate.py args ")
         print(" ".join(config_to_evaluate_args(cfg)))
         return
 
@@ -299,7 +266,7 @@ def main():
     if "all" in stages:
         stages = ["build", "eval", "calib", "analyze", "tables"]
 
-    # ── Persist the fully-resolved run config + open the shared log ───────────
+    #  Persist the fully-resolved run config + open the shared log 
     global _LOG_PATH
     out_dir = os.path.join(PROJECT, cfg.paths.output_dir)
     os.makedirs(out_dir, exist_ok=True)

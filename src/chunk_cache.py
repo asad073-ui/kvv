@@ -1,32 +1,3 @@
-"""
-chunk_cache.py  –  Offline KV-cache builder for TurboRAG quantization study.
-
-For every document chunk it:
-  1. Tokenises the chunk with <|doc_start|> … <|doc_end|> delimiters.
-  2. Runs a forward pass through Qwen2ModifiedForCausalLM to obtain the raw KV cache.
-  3. Compresses the KV cache to FP16, INT8, and INT4 and saves each version.
-  4. Builds a LlamaIndex VectorStore index over all nodes (one per chunk), where
-     each node carries the paths to its three cached files.
-
-Documents are sourced from the DPR Wikipedia passages TSV hosted by Facebook:
-  https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz
-
-On the first run the requested passages are streamed and saved to
---wiki_docs_save_dir/wiki_passages.jsonl.  Subsequent runs reload from that
-file so no re-download is needed.  Only ~1 MB is transferred for 10k passages
-(the first rows of the 2.2 GB gzip, then the connection is closed).
-
-Usage
-─────
-python src/chunk_cache.py \
-    --model_name       /path/to/Qwen2.5-3B-Instruct \
-    --wiki_docs_url    https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz \
-    --wiki_docs_num    10000 \
-    --wiki_docs_save_dir /scratch/$USER/turborag_quant/wiki_dpr_docs \
-    --output_path        /scratch/$USER/turborag_quant/chunk_kvcache \
-    --storage_dir        /scratch/$USER/turborag_quant/doc_emb
-"""
-
 import os
 import json
 import csv
@@ -56,9 +27,9 @@ PRECISIONS = ("fp16", "int8", "int4")
 DPR_TSV_URL = "https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz"
 
 
-# -
+
 # CLI
-# -
+
 
 def get_args():
     parser = argparse.ArgumentParser(
@@ -190,9 +161,7 @@ def load_wiki_dpr_documents(
     return docs
 
 
-# -
 # Local document fallback (original documents/ directory loader)
-# -
 
 def load_local_documents(documents_dir: str) -> List[Document]:
     from llama_index.core import SimpleDirectoryReader
@@ -202,9 +171,9 @@ def load_local_documents(documents_dir: str) -> List[Document]:
     return docs
 
 
-# -
+
 # HotpotQA corpus loader (replaces the DPR Wikipedia download for the MVE)
-# -
+
 
 def load_hotpotqa_corpus(hf_dataset, num_examples: int = 100) -> List[Document]:
     """
@@ -244,9 +213,9 @@ def load_hotpotqa_corpus(hf_dataset, num_examples: int = 100) -> List[Document]:
     return docs
 
 
-# -
+
 # RGB corpus loader (noisy-retrieval positives + negatives from local JSONL)
-# -
+
 
 def load_rgb_corpus(rgb_jsonl: str, num_examples: int = 0) -> List[Document]:
     """
@@ -293,9 +262,9 @@ def load_rgb_corpus(rgb_jsonl: str, num_examples: int = 0) -> List[Document]:
     return docs
 
 
-# -
+
 # Helper: normalise DynamicCache.to_legacy_cache() output
-# -
+
 
 def _to_per_layer_pairs(legacy_cache):
     """
@@ -334,9 +303,9 @@ def _to_per_layer_pairs(legacy_cache):
     return list(legacy_cache)
 
 
-# -
+
 # Core: compute + save per-chunk KV caches
-# -
+
 
 def compute_and_save_chunk(
     chunk_text: str,
@@ -375,9 +344,9 @@ def compute_and_save_chunk(
     return paths
 
 
-# -
+
 # LlamaIndex node parser that wraps our cache builder
-# -
+
 
 class KVCachedNodeParser:
     """
@@ -438,7 +407,7 @@ class KVCachedNodeParser:
 
 
 # Main
-# -
+
 
 def main():
     args   = get_args()
@@ -468,12 +437,7 @@ def main():
     os.makedirs(args.output_path, exist_ok=True)
     os.makedirs(args.storage_dir,  exist_ok=True)
 
-    # - Load documents -
-    # Sources are now ADDITIVE: a single global retrieval corpus is built from
-    # the union of every enabled source.  This is what makes the full 3-dataset
-    # experiment possible — HotpotQA paragraphs give multi-hop recall, RGB docs
-    # give noisy-retrieval recall, and the DPR wiki passages give NQ-Open
-    # coverage (scaled by --wiki_docs_num / --wiki_pages).
+
     documents: List[Document] = []
     corpus_manifest = {}
 
