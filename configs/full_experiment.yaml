@@ -75,21 +75,23 @@ generation:
   do_sample:      false
   temperature:    null
 
-# Faithfulness evaluation 
-
+# Faithfulness evaluation
+#
 # faithfulness_mode:
-#   per_chunk_max – max faithfulness across retrieved chunks (lenient; avoids the
-#                   K-dependent truncation artifact, but can MASK H2 amplification).
 #   full_context  – score the answer against the concatenated context the model
-#                   actually attended over (paper-faithful for H2; HHEM/NLI handle
-#                   their own truncation). Recommended to run BOTH and report.
+#                   actually attended over (paper-faithful; required for H2 multi-chunk
+#                   amplification claim). HHEM/NLI handle their own truncation.
+#                   ** This is the default — use it for H1, H2, and H3 claims. **
+#   per_chunk_max – max faithfulness across retrieved chunks (lenient; avoids the
+#                   K-dependent truncation artifact, but MASKS H2 amplification).
+#                   Run a second pass with this mode to show robustness.
 evaluation:
   eval_hhem: true
   eval_nli:  true
   hhem_model: "vectara/hallucination_evaluation_model"
   nli_model:  "cross-encoder/nli-deberta-v3-large"
   hallucination_threshold: 0.5
-  faithfulness_mode: "per_chunk_max"
+  faithfulness_mode: "full_context"
   hhem_batch_size: 16
   nli_batch_size:  16
 

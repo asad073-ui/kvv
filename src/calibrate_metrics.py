@@ -1,21 +1,3 @@
-"""
-calibrate_metrics.py  –  Stage 8: Metric Calibration Study.
-
-Runs HHEM-2.1-Open and DeBERTa-NLI on a calibration set of N examples
-under the FP16 TurboRAG condition and reports:
-  - Pearson / Spearman correlation between the two signals
-  - Agreement rate (both flag same examples as hallucinated)
-  - A scatter-plot CSV for plotting
-
-Usage
-─────
-python src/calibrate_metrics.py \
-    --results_jsonl results/results_<timestamp>.jsonl \
-    --condition C1 \
-    --n_calibration 50 \
-    --output_dir results/calibration
-"""
-
 import os, sys, json, argparse
 import torch
 from scipy.stats import pearsonr, spearmanr

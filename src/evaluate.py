@@ -136,21 +136,31 @@ def trim_context_for_hhem(context: str, max_tokens: int = 400) -> str:
 
 def _extract_short_answer(text: str) -> str:
     """
-    FIX-EXTRACT: Pull a short answer span from a free-form generation.
+    Pull a short answer span from a free-form generation for EM/F1 computation.
 
-    Used ONLY for EM computation.  F1, HHEM, and NLI intentionally keep raw
-    preds because they reward partial matches / faithfulness of the full response.
+    F1, HHEM, and NLI intentionally receive the raw prediction because they
+    reward partial matches / faithfulness of the full response.
 
-    Strategy (multi-tier, from most to least specific):
-      1. Explicit answer markers: "the answer is", "answer is", "answer:"
-      2. First sentence: most QA models front-load the answer.
-      3. First N words: last resort for single-phrase outputs.
+    Tiers (most → least specific):
+      0. Yes/No: first word is "yes"/"no" with a word boundary (HotpotQA binary).
+         "No, both are American" → "no".  Checked before sentence-splitting so a
+         comma/explanation after the answer word doesn't swallow it.
+      1. Explicit markers: "the answer is", "answer:", etc.
+      1.5 First short phrase before a comma: catches "Albert Einstein, who..."
+         → "Albert Einstein" for named-entity and date answers (≤6 words).
+      2. First sentence (≤15 words).
+      3. First 10 words as last resort.
     """
     text = text.strip()
     if not text:
         return ""
 
     lower = text.lower()
+
+    # ── Tier 0: Yes/No binary questions (HotpotQA) ──
+    m_yn = re.match(r'^(yes|no)\b', lower)
+    if m_yn:
+        return m_yn.group(1)
 
     # ── Tier 1: explicit answer-introducing phrases (high confidence) ──
     explicit_markers = [
@@ -169,6 +179,15 @@ def _extract_short_answer(text: str) -> str:
             span = span.strip().rstrip('.')
             if 1 <= len(span.split()) <= 12:
                 return span
+
+    # ── Tier 1.5: first short phrase before a comma ──
+    # Catches "Albert Einstein, who developed..." → "Albert Einstein"
+    # and "January 2, 2022, was the premiere date" → handled by Tier 1 or 2.
+    comma_idx = text.find(',')
+    if comma_idx != -1:
+        first_phrase = text[:comma_idx].strip().rstrip('.')
+        if 1 <= len(first_phrase.split()) <= 6:
+            return first_phrase
 
     # ── Tier 2: first sentence ──
     sentences = re.split(r'(?<=\w)\.\s', text, maxsplit=1)
@@ -380,15 +399,18 @@ def run_query(
     kv_size_bytes = 0
 
     if condition == "C0":
-        # Task 5: wrap raw text with the same delimiters used for C1-C3 chunk caches
-        # so C0 and C1 differ only by retrieval condition (not by delimiter tokens).
+        # Wrap raw text with delimiters for the generation prompt (same as C1-C3 build step),
+        # but keep bare raw_text in chunk_texts for HHEM/NLI scoring so C0 and C1-C3 differ
+        # only by retrieval path — not by special-token noise fed into the faithfulness scorers.
+        model_chunks: List[str] = []
         for nws in nodes_k:
             raw = nws.node.metadata.get("raw_text", nws.node.text)
-            chunk_texts.append(f"<|doc_start|>{raw}<|doc_end|>")
+            model_chunks.append(f"<|doc_start|>{raw}<|doc_end|>")
+            chunk_texts.append(raw)  # bare text for HHEM/NLI (Issue 6 fix)
 
         io_time = 0.0
         ttft_start = time.perf_counter()
-        answer, ttft_first = generate_with_cache(model, tokenizer, device, None, query, chunk_texts)
+        answer, ttft_first = generate_with_cache(model, tokenizer, device, None, query, model_chunks)
         total_latency = time.perf_counter() - ttft_start
         ttft = ttft_first if ttft_first is not None else total_latency
 
@@ -475,8 +497,14 @@ def _load_from_hf(
         # Task 6: keep full answer list for multi-answer datasets (e.g. NQ-Open).
         a_raw = row.get(answer_field) or row.get("answer", "")
         if isinstance(a_raw, list) and all(isinstance(x, str) for x in a_raw):
-            # Multi-answer: keep the full list for max-over-golds scoring.
+            # Flat list of aliases: keep all for max-over-golds scoring.
             a_normalized = a_raw
+        elif isinstance(a_raw, list) and a_raw and isinstance(a_raw[0], list):
+            # Nested list [[alias1, alias2, ...]]: flatten one level.
+            # Seen in RGB-style jsonl where answer is [[alt1, alt2, ...]].
+            a_normalized = [s for sub in a_raw for s in sub if isinstance(s, str) and s]
+            if not a_normalized:
+                a_normalized = [""]
         elif isinstance(a_raw, list):
             a_raw = a_raw[0] if a_raw else ""
             while isinstance(a_raw, list):
@@ -501,9 +529,15 @@ def _load_from_jsonl(query_file: str, num_examples: int) -> List[Dict]:
             data   = json.loads(line.strip())
             query  = data.get("query") or data.get("question", "")
             a_raw  = data.get("answer") or data.get("answers", "")
-            # Task 6: same multi-answer normalization as _load_from_hf.
+            # Same multi-answer normalization as _load_from_hf.
             if isinstance(a_raw, list) and all(isinstance(x, str) for x in a_raw):
                 a_normalized = a_raw
+            elif isinstance(a_raw, list) and a_raw and isinstance(a_raw[0], list):
+                # Nested list [[alias1, alias2, ...]]: flatten one level.
+                # Seen in RGB jsonl where answer is [[alt1, alt2, ...]].
+                a_normalized = [s for sub in a_raw for s in sub if isinstance(s, str) and s]
+                if not a_normalized:
+                    a_normalized = [""]
             elif isinstance(a_raw, list):
                 a_raw = a_raw[0] if a_raw else ""
                 while isinstance(a_raw, list):
