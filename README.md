@@ -127,7 +127,6 @@ stdout of all stages is teed to `results/logs_<ts>.txt`.
 ```
 turborag_quant/
 ├── configs/
-│   ├── experiment.yaml         # MVE / smoke-test profile (HotpotQA only)
 │   └── full_experiment.yaml    # ← FULL paper profile (NQ + HotpotQA + RGB)
 ├── src/
 │   ├── qwen2.py                # Modified Qwen2 with RoPE-free (raw) key caching
