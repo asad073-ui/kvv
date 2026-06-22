@@ -1,0 +1,14 @@
+*.pyc
+*.txt
+# requirements.txt must stay tracked (it was being swallowed by *.txt -> K9)
+!requirements.txt
+/documents
+/__pycache__
+
+# Secrets — never commit the Anthropic API key (LLM judge). Export it in the
+# shell on the instance instead: export ANTHROPIC_API_KEY=sk-ant-...
+.env
+.env.*
+set_env.sh
+*secret*
+*.key

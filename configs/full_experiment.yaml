@@ -1,0 +1,152 @@
+
+model:
+  # Debug on 3B; switch to 7B only for the final run (see RUN_3090.md budget note).
+  name: "Qwen/Qwen2.5-3B-Instruct"
+  # name: "Qwen/Qwen2.5-7B-Instruct"
+  use_flash_attn: false              # raw-key storage requires eager attention
+  dtype: "bfloat16"                  # ROOT CAUSE 1: Qwen2.5 is bf16-native; fp16 overflows → NaN→token-0 corruption
+
+# ── Precompute methodology (ROOT CAUSE 2) ────────────────────────────────────
+# standard_causal (default): concatenate retrieved chunks → ONE stock causal
+#   prefill → that is the precomputed cache → quantize it. In-distribution, needs
+#   no SFT, so C1 passes the Stage-0 gate and the quantization effect is isolated.
+# reordered: legacy TurboRAG independent-attention scheme. OOD without SFT — keep
+#   ONLY as a clearly-labelled secondary baseline, never the headline result.
+precompute_mode: "standard_causal"
+
+embedding:
+  name: "BAAI/bge-small-en-v1.5"
+
+chunking:
+  chunk_size:    512
+  chunk_overlap: 10
+
+#  Document corpus
+# num_docs > 0 enables the DPR Wikipedia stream (NQ-Open coverage). It is COMBINED
+# with the HotpotQA paragraphs and RGB documents into one global retrieval index.
+# Fix 6: DISABLED (0) for the headline RGB-only run. NQ-Open over a 10k-page DPR
+# slice is a retrieval-coverage confound and the ~92 GB disk bottleneck; drop it
+# unless a proper full DPR index is guaranteed.
+wiki_docs:
+  download_url: "https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz"
+  num_docs:     0
+  save_dir:     "${SCRATCH_DIR}/wiki_dpr_docs"
+
+paths:
+  kvcache_dir:  "${SCRATCH_DIR}/chunk_kvcache/${MODEL_SLUG}"
+  storage_dir:  "${SCRATCH_DIR}/doc_emb/${MODEL_SLUG}"
+  output_dir:   "${SCRATCH_DIR}/results/${MODEL_SLUG}"
+  analysis_dir: "${SCRATCH_DIR}/analysis/${MODEL_SLUG}"
+
+retrieval:
+  similarity_top_k: 10               # must be >= max(k_values)
+
+conditions: [C0, C1, C2, C3]
+k_values:   [1, 3, 5]
+
+datasets:
+  # Fix 6: RGB-only headline run. NQ-Open dropped (retrieval-coverage confound;
+  # needs a real DPR index) and HotpotQA kept as an OPTIONAL secondary — set its
+  # num_examples > 0 to re-enable. num_examples <= 0 disables a dataset entirely.
+  nq_open:
+    hf_name:        "nq_open"
+    hf_config:      null
+    hf_split:       "validation"
+    question_field: "question"
+    answer_field:   "answer"
+    num_examples:   0
+    description:    "Single-hop open-domain QA (DISABLED — needs full DPR index)"
+
+  hotpotqa:
+    hf_name:        "hotpotqa/hotpot_qa"
+    hf_config:      "distractor"
+    hf_split:       "validation"
+    question_field: "question"
+    answer_field:   "answer"
+    num_examples:   0
+    use_provided_context: true
+    description:    "Multi-hop QA (optional secondary; set num_examples>0 to enable)"
+
+  rgb:
+    hf_name:        null
+    hf_config:      null
+    hf_split:       null
+    question_field: "question"
+    answer_field:   "answer"
+    query_file:     "questions/rgb.jsonl"   # ships positive + negative docs
+    num_examples:   200
+    description:    "RAG robustness under noisy retrieval (H1, H3)"
+
+# MVE disabled for the full paper run.
+mve:
+  enabled:      false
+  num_examples: 200
+  datasets:     ["nq_open", "hotpotqa", "rgb"]
+  k_values:     [1, 3, 5]
+
+generation:
+  max_new_tokens: 64
+  do_sample:      false
+  temperature:    null
+
+# Faithfulness evaluation
+#
+# faithfulness_mode:
+#   full_context  – score the answer against the concatenated context the model
+#                   actually attended over (paper-faithful; required for H2 multi-chunk
+#                   amplification claim). HHEM/NLI handle their own truncation.
+#                   ** This is the default — use it for H1, H2, and H3 claims. **
+#   per_chunk_max – max faithfulness across retrieved chunks (lenient; avoids the
+#                   K-dependent truncation artifact, but MASKS H2 amplification).
+#                   Run a second pass with this mode to show robustness.
+evaluation:
+  eval_hhem: true
+  eval_nli:  true
+  hhem_model: "vectara/hallucination_evaluation_model"
+  nli_model:  "cross-encoder/nli-deberta-v3-large"
+  hallucination_threshold: 0.5
+  faithfulness_mode: "full_context"
+  hhem_batch_size: 16
+  nli_batch_size:  16
+
+# ── LLM-as-judge (A3: third faithfulness/accuracy anchor) ────────────────────
+# Optional post-hoc Claude judge over results_*.jsonl. De-risks the weak HHEM↔NLI
+# agreement (pilot Pearson 0.50 / Spearman 0.26) by adding a per-example
+# faithful/correct label. Runs OUTSIDE the GPU loop, so it can never destabilise
+# the numerical-validity path. Skipped automatically if ANTHROPIC_API_KEY is unset.
+#
+# BUDGET NOTE (Anthropic API, separate from GPU billing):
+#   Haiku 4.5 = $1/1M input, $5/1M output. With the 2000-char context cap below
+#   each call is ~0.75K input + ~25 output tokens ≈ $0.0009. Focusing on the
+#   C1 vs C3 pair (what the H1 robustness flip actually compares) keeps the whole
+#   RGB run around $1. Widen `conditions` or raise the cap only if budget allows.
+#   llm_judge.py prints a cost estimate before spending anything.
+llm_judge:
+  enabled:       true
+  model:         "claude-haiku-4-5"   # $1/$5 per 1M tok — cheapest capable judge
+  conditions:    ["C1", "C3"]         # FP16 vs INT4: the pair the H1 flip compares
+  max_per_group: 0                    # 0 = all in those conditions; set N to cap per dataset/K/condition
+  max_records:   -1                   # global hard ceiling; -1 = no extra cap
+  validate_n:    50                   # anchor judge↔containment-EM agreement on 50 examples
+
+calibration:
+  # Fix 5: calibrate HHEM vs NLI on a VARIANCE-BEARING set, not a single-condition
+  # cluster. "all" draws across C0–C3 (and all active datasets) so the correlation
+  # reflects real spread instead of a near-zero-variance C1 blob that produced a
+  # spurious 'agree' verdict. HHEM is only declared primary if BOTH Pearson and
+  # Spearman are significant (p < 0.05) — enforced in calibrate_metrics.py.
+  n_examples: 300
+  condition:  "all"
+
+# ── Stage-0 baseline-fidelity gate (ROOT CAUSE 1 + 2) ────────────────────────
+# Runs C0 + C1 on a small slice and halts before C2/C3 unless the baseline is
+# trustworthy. Tune tolerances here if needed.
+stage0:
+  n_examples:          50
+  acc_rel_tol:         0.10          # C1 EM/F1 must be within 10% of C0
+  faith_abs_tol:       0.10          # C1 hallucination within 10pp of C0
+  max_degenerate_rate: 0.02          # < 2% degenerate generations per condition
+
+gpu:
+  chunk_cache_gpu: 0
+  evaluate_gpu:    0                 # single RTX 3090

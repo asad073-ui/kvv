@@ -1,0 +1,30 @@
+#  Core ML 
+torch>=2.1.0
+transformers==4.51.3
+accelerate>=0.28.0
+
+#  RAG / Retrieval 
+llama-index-core>=0.10.0
+llama-index-embeddings-huggingface>=0.2.0
+sentence-transformers>=2.6.0
+faiss-cpu>=1.7.4
+
+#  Datasets / Faithfulness evaluation 
+
+datasets>=2.18.0,<3.0.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+
+#  Statistics 
+
+statsmodels>=0.14.0
+scipy>=1.11.0
+numpy>=1.24.0
+
+#  Utilities
+tabulate>=0.9.0
+tqdm>=4.66.0
+pyyaml>=6.0
+
+#  Optional: LLM-as-judge (Fix 4) — only needed if you run src/llm_judge.py
+anthropic>=0.40.0

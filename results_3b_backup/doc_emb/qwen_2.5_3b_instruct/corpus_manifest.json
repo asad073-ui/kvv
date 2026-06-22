@@ -1,0 +1,13 @@
+{
+  "rgb_docs": 1279,
+  "rgb_num_examples": 50,
+  "num_chunks": 1279,
+  "precisions": [
+    "fp16",
+    "int8",
+    "int4"
+  ],
+  "chunk_size": 512,
+  "chunk_overlap": 10,
+  "embedding_model": "BAAI/bge-small-en-v1.5"
+}

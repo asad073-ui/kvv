@@ -1,0 +1,4 @@
+condition,avg_relative_f1_drop,avg_hall_delta_pp
+C1,0.0,0.0
+C2,3.0,3.05
+C3,50.93,56.89
