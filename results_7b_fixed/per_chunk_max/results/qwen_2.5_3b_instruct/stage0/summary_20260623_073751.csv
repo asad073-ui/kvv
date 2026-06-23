@@ -1,0 +1,7 @@
+"dataset","k","condition","condition_label","precompute_mode","faithfulness_mode","wiki_pages","n_examples","n_hall","n_total","n_ctx_over_512","paired_n","refusal_rate","n_nonfinite","n_degenerate","degenerate_rate","EM","contain_EM","F1","hallucination_rate","entailment_score","avg_ttft_s","avg_latency_s","avg_io_s","avg_kv_bytes"
+"rgb","1","C0","Full-Context Oracle","standard_causal","per_chunk_max","0","50","0","39","0","40","0.22","0","0","0.0","0.08","0.72","0.3197","0.0","0.7237","0.9726","0.9726","0.0","0"
+"rgb","1","C1","FP16 Precomputed-KV","standard_causal","per_chunk_max","0","50","1","40","0","40","0.2","0","0","0.0","0.08","0.74","0.3265","0.025","0.7047","0.054","0.9713","0.0507","15846440"
+"rgb","3","C0","Full-Context Oracle","standard_causal","per_chunk_max","0","50","0","47","26","47","0.06","0","0","0.0","0.1","0.82","0.3441","0.0","0.8674","1.1225","1.1225","0.0","0"
+"rgb","3","C1","FP16 Precomputed-KV","standard_causal","per_chunk_max","0","50","0","47","26","47","0.06","0","0","0.0","0.08","0.82","0.3355","0.0","0.8677","0.0549","1.1019","0.0564","40568586"
+"rgb","5","C0","Full-Context Oracle","standard_causal","per_chunk_max","0","50","0","48","44","48","0.04","0","0","0.0","0.12","0.88","0.3984","0.0","0.8846","1.2745","1.2745","0.0","0"
+"rgb","5","C1","FP16 Precomputed-KV","standard_causal","per_chunk_max","0","50","0","48","44","48","0.04","0","0","0.0","0.12","0.88","0.3921","0.0","0.8852","0.055","1.246","0.0789","65145077"

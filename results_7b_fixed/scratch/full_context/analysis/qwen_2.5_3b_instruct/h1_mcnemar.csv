@@ -1,0 +1,5 @@
+dataset,k,n_pairs,both_faithful_a,faithful_to_hall_b,hall_to_faithful_c,both_hall_d,mcnemar_p,h1_supported
+rgb,1,230,189,24,4,13,0.00033,True
+rgb,3,240,201,31,1,7,0.0,True
+rgb,5,231,178,50,2,1,0.0,True
+POOLED,all,701,568,105,7,21,0.0,True

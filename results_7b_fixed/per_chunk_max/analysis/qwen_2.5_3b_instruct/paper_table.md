@@ -1,0 +1,15 @@
+# Precomputed-KV-Cache RAG — Quantization Faithfulness — Main Results
+
+_model_: `Qwen/Qwen2.5-7B-Instruct` · _wiki_pages_: 0 · _datasets_: rgb · _K_: [1, 3, 5] · _conditions_: ['C0', 'C1', 'C3']
+
+| Dataset | K | Condition | ContainEM (prim.) | EM | F1 (secondary) | Hallucination | Entailment | NonFinite | Degen. | KV Size (MB) | TTFT (s) | Latency (s) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| rgb | 1 | Full-Context Oracle | 0.7433 | 0.0833 | 0.3297 | 0.0584 | 0.6638 | 0 | 0.0000 | 0.000 | 0.9223 | 0.9223 |
+| rgb | 1 | FP16 Precomputed-KV | 0.7467 | 0.0700 | 0.3206 | 0.0667 | 0.6716 | 0 | 0.0000 | 15.870 | 0.0545 | 0.9296 |
+| rgb | 1 | INT4 Precomputed-KV | 0.6633 | 0.0133 | 0.2351 | 0.1569 | 0.6459 | 0 | 0.0067 | 4.463 | 0.0539 | 1.0536 |
+| rgb | 3 | Full-Context Oracle | 0.8467 | 0.1333 | 0.4005 | 0.0481 | 0.7479 | 0 | 0.0000 | 0.000 | 1.0334 | 1.0334 |
+| rgb | 3 | FP16 Precomputed-KV | 0.8567 | 0.1200 | 0.3849 | 0.0455 | 0.7788 | 0 | 0.0000 | 39.335 | 0.0557 | 1.0424 |
+| rgb | 3 | INT4 Precomputed-KV | 0.7233 | 0.0100 | 0.2348 | 0.1958 | 0.7336 | 0 | 0.0267 | 11.063 | 0.0541 | 1.2272 |
+| rgb | 5 | Full-Context Oracle | 0.9133 | 0.1133 | 0.4071 | 0.0270 | 0.8425 | 0 | 0.0000 | 0.000 | 1.1961 | 1.1961 |
+| rgb | 5 | FP16 Precomputed-KV | 0.9033 | 0.1233 | 0.4135 | 0.0240 | 0.8344 | 0 | 0.0000 | 62.320 | 0.0560 | 1.1329 |
+| rgb | 5 | INT4 Precomputed-KV | 0.7100 | 0.0167 | 0.2430 | 0.2603 | 0.7356 | 0 | 0.0600 | 17.527 | 0.0544 | 1.3559 |

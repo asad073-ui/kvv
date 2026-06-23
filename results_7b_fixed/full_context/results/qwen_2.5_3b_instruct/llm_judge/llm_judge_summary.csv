@@ -1,0 +1,7 @@
+dataset,k,condition,n,llm_correct_rate,llm_faithful_rate
+rgb,1,C1,258,0.8217,0.8643
+rgb,1,C3,266,0.6767,0.6955
+rgb,3,C1,291,0.8625,0.8591
+rgb,3,C3,291,0.6598,0.6151
+rgb,5,C1,297,0.8822,0.8653
+rgb,5,C3,295,0.6,0.5356
